@@ -9,6 +9,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Storage;
 
 final class MobileOutboundController extends Controller
 {
@@ -366,6 +367,18 @@ final class MobileOutboundController extends Controller
 
             'attachments' => ['nullable', 'array', 'max:3'],
             'attachments.*' => ['file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
+
+            // Kompatibilitas nama field dari mobile.
+            // Flutter versi sebelumnya mengirim delete_attachment_ids[],
+            // sedangkan controller lama hanya membaca removed_attachment_ids[].
+            'removed_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'removed_attachment_ids.*' => ['integer', 'distinct'],
+            'delete_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'delete_attachment_ids.*' => ['integer', 'distinct'],
+            'deleted_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'deleted_attachment_ids.*' => ['integer', 'distinct'],
+            'remove_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'remove_attachment_ids.*' => ['integer', 'distinct'],
         ]);
 
         $user = $request->user();
@@ -393,18 +406,47 @@ final class MobileOutboundController extends Controller
             ->where('outbound_transaction_id', $id)
             ->count();
 
+        $removedAttachmentIds = collect($this->extractAttachmentIdsFromRequest($request, [
+            'removed_attachment_ids',
+            'delete_attachment_ids',
+            'deleted_attachment_ids',
+            'remove_attachment_ids',
+        ]))
+            ->map(fn ($attachmentId): int => (int) $attachmentId)
+            ->filter(fn (int $attachmentId): bool => $attachmentId > 0)
+            ->unique()
+            ->values();
+
+        $attachmentsToRemove = $removedAttachmentIds->isEmpty()
+            ? collect()
+            : DB::table('outbound_transaction_attachments')
+                ->where('outbound_transaction_id', $id)
+                ->whereIn('id', $removedAttachmentIds->all())
+                ->get(['id', 'file_path']);
+
         $newAttachmentCount = $request->hasFile('attachments')
             ? count($request->file('attachments'))
             : 0;
 
-        if (($existingAttachmentCount + $newAttachmentCount) > 3) {
+        $remainingAttachmentCount = max(
+            0,
+            $existingAttachmentCount - $attachmentsToRemove->count()
+        );
+
+        if (($remainingAttachmentCount + $newAttachmentCount) > 3) {
             return response()->json([
                 'success' => false,
-                'message' => 'Total lampiran maksimal 3 file. Hapus lampiran lama melalui dashboard admin atau jangan tambahkan lampiran baru.',
+                'message' => 'Total lampiran setelah perubahan maksimal 3 file.',
             ], 422);
         }
 
-        $updatedTransaction = DB::transaction(function () use ($request, $validated, $id, $user) {
+        $updatedTransaction = DB::transaction(function () use (
+            $request,
+            $validated,
+            $id,
+            $user,
+            $attachmentsToRemove
+        ) {
             $customerId = $this->resolveCustomerId(
                 isset($validated['customer_id']) ? (int) $validated['customer_id'] : null,
                 $validated['customer_name'] ?? null,
@@ -576,6 +618,13 @@ final class MobileOutboundController extends Controller
                 ]);
             }
 
+            if ($attachmentsToRemove->isNotEmpty()) {
+                DB::table('outbound_transaction_attachments')
+                    ->where('outbound_transaction_id', $id)
+                    ->whereIn('id', $attachmentsToRemove->pluck('id')->all())
+                    ->delete();
+            }
+
             if ($request->hasFile('attachments')) {
                 foreach ($request->file('attachments') as $file) {
                     $path = $file->store('inventory/outbounds/'.$id, 'public');
@@ -598,6 +647,16 @@ final class MobileOutboundController extends Controller
                 ->first();
         });
 
+        $removedFilePaths = $attachmentsToRemove
+            ->pluck('file_path')
+            ->filter(fn ($filePath): bool => is_string($filePath) && $filePath !== '')
+            ->values()
+            ->all();
+
+        if ($removedFilePaths !== []) {
+            Storage::disk('public')->delete($removedFilePaths);
+        }
+
         return response()->json([
             'success' => true,
             'message' => 'Pengajuan barang keluar berhasil diperbarui.',
@@ -610,6 +669,8 @@ final class MobileOutboundController extends Controller
                 'status' => $updatedTransaction->status,
                 'sub_total' => (float) $updatedTransaction->sub_total,
                 'grand_total' => (float) $updatedTransaction->grand_total,
+                'removed_attachment_count' => $attachmentsToRemove->count(),
+                'removed_attachment_ids' => $attachmentsToRemove->pluck('id')->values(),
             ],
         ]);
     }
@@ -787,6 +848,56 @@ final class MobileOutboundController extends Controller
                 'approval_note' => $transaction->approval_note,
             ],
         ]);
+    }
+
+    /**
+     * Ambil ID lampiran yang ingin dihapus dari beberapa kemungkinan nama field.
+     *
+     * Mobile Flutter pernah mengirim:
+     * - delete_attachment_ids[]
+     * - deleted_attachment_ids[]
+     * - remove_attachment_ids[]
+     *
+     * Controller lama hanya membaca removed_attachment_ids[], sehingga lampiran
+     * terhapus di tampilan edit, tetapi muncul lagi setelah detail di-refresh.
+     */
+    private function extractAttachmentIdsFromRequest(Request $request, array $keys): array
+    {
+        $ids = [];
+
+        foreach ($keys as $key) {
+            $value = $request->input($key, []);
+
+            if ($value === null || $value === '') {
+                continue;
+            }
+
+            if (! is_array($value)) {
+                $value = [$value];
+            }
+
+            foreach ($value as $item) {
+                if (is_array($item)) {
+                    foreach ($item as $nestedItem) {
+                        $attachmentId = (int) $nestedItem;
+
+                        if ($attachmentId > 0) {
+                            $ids[] = $attachmentId;
+                        }
+                    }
+
+                    continue;
+                }
+
+                $attachmentId = (int) $item;
+
+                if ($attachmentId > 0) {
+                    $ids[] = $attachmentId;
+                }
+            }
+        }
+
+        return array_values(array_unique($ids));
     }
 
     private function resolveCustomerId(?int $customerId, ?string $customerName): ?int

@@ -9,6 +9,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Storage;
 
 final class MobileInboundController extends Controller
 {
@@ -272,6 +273,16 @@ final class MobileInboundController extends Controller
 
             'attachments' => ['nullable', 'array', 'max:3'],
             'attachments.*' => ['file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
+
+            // Dipakai oleh aplikasi mobile ketika user menghapus lampiran lama saat edit.
+            'removed_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'removed_attachment_ids.*' => ['integer', 'distinct'],
+            'delete_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'delete_attachment_ids.*' => ['integer', 'distinct'],
+            'deleted_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'deleted_attachment_ids.*' => ['integer', 'distinct'],
+            'remove_attachment_ids' => ['nullable', 'array', 'max:3'],
+            'remove_attachment_ids.*' => ['integer', 'distinct'],
         ]);
 
         $user = $request->user();
@@ -299,18 +310,49 @@ final class MobileInboundController extends Controller
             ->where('inbound_transaction_id', $id)
             ->count();
 
+        $removedAttachmentIds = $this->collectAttachmentIds($request, [
+            'removed_attachment_ids',
+            'delete_attachment_ids',
+            'deleted_attachment_ids',
+            'remove_attachment_ids',
+        ]);
+
+        $attachmentsToRemove = $removedAttachmentIds->isEmpty()
+            ? collect()
+            : DB::table('inbound_transaction_attachments')
+                ->where('inbound_transaction_id', $id)
+                ->whereIn('id', $removedAttachmentIds->all())
+                ->get(['id', 'file_path']);
+
         $newAttachmentCount = $request->hasFile('attachments')
             ? count($request->file('attachments'))
             : 0;
 
-        if (($existingAttachmentCount + $newAttachmentCount) > 3) {
+        $remainingAttachmentCount = max(
+            0,
+            $existingAttachmentCount - $attachmentsToRemove->count()
+        );
+
+        if (($remainingAttachmentCount + $newAttachmentCount) > 3) {
             return response()->json([
                 'success' => false,
-                'message' => 'Total lampiran maksimal 3 file. Hapus lampiran lama melalui dashboard admin atau jangan tambahkan lampiran baru.',
+                'message' => 'Total lampiran setelah perubahan maksimal 3 file.',
+                'meta' => [
+                    'existing_attachment_count' => $existingAttachmentCount,
+                    'removed_attachment_count' => $attachmentsToRemove->count(),
+                    'new_attachment_count' => $newAttachmentCount,
+                    'remaining_attachment_count' => $remainingAttachmentCount,
+                ],
             ], 422);
         }
 
-        $updatedTransaction = DB::transaction(function () use ($request, $validated, $id, $user) {
+        $updatedTransaction = DB::transaction(function () use (
+            $request,
+            $validated,
+            $id,
+            $user,
+            $attachmentsToRemove
+        ) {
             $supplierId = $this->resolveSupplierId(
                 isset($validated['supplier_id']) ? (int) $validated['supplier_id'] : null,
                 $validated['supplier_name'] ?? null,
@@ -414,6 +456,13 @@ final class MobileInboundController extends Controller
                 ]);
             }
 
+            if ($attachmentsToRemove->isNotEmpty()) {
+                DB::table('inbound_transaction_attachments')
+                    ->where('inbound_transaction_id', $id)
+                    ->whereIn('id', $attachmentsToRemove->pluck('id')->all())
+                    ->delete();
+            }
+
             if ($request->hasFile('attachments')) {
                 foreach ($request->file('attachments') as $file) {
                     $path = $file->store('inventory/inbounds/'.$id, 'public');
@@ -436,6 +485,17 @@ final class MobileInboundController extends Controller
                 ->first();
         });
 
+        $removedFilePaths = $attachmentsToRemove
+            ->pluck('file_path')
+            ->map(fn ($filePath) => $this->normalizePublicStoragePath($filePath))
+            ->filter(fn (?string $filePath): bool => $filePath !== null && $filePath !== '')
+            ->values()
+            ->all();
+
+        if ($removedFilePaths !== []) {
+            Storage::disk('public')->delete($removedFilePaths);
+        }
+
         return response()->json([
             'success' => true,
             'message' => 'Pengajuan barang masuk berhasil diperbarui.',
@@ -447,6 +507,8 @@ final class MobileInboundController extends Controller
                 'status' => $updatedTransaction->status,
                 'sub_total' => (float) $updatedTransaction->sub_total,
                 'grand_total' => (float) $updatedTransaction->grand_total,
+                'removed_attachment_count' => $attachmentsToRemove->count(),
+                'removed_attachment_ids' => $attachmentsToRemove->pluck('id')->values(),
             ],
         ]);
     }
@@ -602,6 +664,70 @@ final class MobileInboundController extends Controller
                 'approval_note' => $transaction->approval_note,
             ],
         ]);
+    }
+
+    /**
+     * Mengambil ID lampiran yang dikirim dari mobile.
+     *
+     * Mobile lama dan mobile baru bisa mengirim nama field berbeda,
+     * jadi controller menerima beberapa alias agar tetap kompatibel.
+     */
+    private function collectAttachmentIds(Request $request, array $fieldNames)
+    {
+        $ids = [];
+
+        foreach ($fieldNames as $fieldName) {
+            $value = $request->input($fieldName, []);
+
+            if ($value === null || $value === '') {
+                continue;
+            }
+
+            if (! is_array($value)) {
+                $value = [$value];
+            }
+
+            foreach ($value as $item) {
+                if (is_array($item)) {
+                    foreach ($item as $nestedItem) {
+                        $ids[] = $nestedItem;
+                    }
+
+                    continue;
+                }
+
+                foreach (explode(',', (string) $item) as $rawId) {
+                    $ids[] = $rawId;
+                }
+            }
+        }
+
+        return collect($ids)
+            ->map(fn ($attachmentId): int => (int) $attachmentId)
+            ->filter(fn (int $attachmentId): bool => $attachmentId > 0)
+            ->unique()
+            ->values();
+    }
+
+    private function normalizePublicStoragePath(?string $filePath): ?string
+    {
+        if ($filePath === null || trim($filePath) === '') {
+            return null;
+        }
+
+        $filePath = trim($filePath);
+        $filePath = str_replace('\\', '/', $filePath);
+        $filePath = ltrim($filePath, '/');
+
+        if (str_starts_with($filePath, 'public/')) {
+            $filePath = substr($filePath, strlen('public/'));
+        }
+
+        if (str_starts_with($filePath, 'storage/')) {
+            $filePath = substr($filePath, strlen('storage/'));
+        }
+
+        return $filePath;
     }
 
     private function resolveSupplierId(?int $supplierId, ?string $supplierName): ?int

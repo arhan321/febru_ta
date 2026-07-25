@@ -2,10 +2,10 @@
 
 namespace App\Http\Controllers\Api\Mobile;
 
-use App\Http\Controllers\Controller;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Schema;
 
 class MobileDashboardController extends Controller
@@ -21,7 +21,11 @@ class MobileDashboardController extends Controller
                 'today_label' => now()->translatedFormat('d M Y'),
                 'stock_summary' => $this->stockSummary(),
                 'attention_items' => $this->attentionItems(),
-                'recent_activities' => $this->recentActivities(),
+
+                // Penting:
+                // Aktivitas terbaru harus berdasarkan akun yang sedang login,
+                // bukan mengambil transaksi global semua user.
+                'recent_activities' => $this->recentActivities((int) $user->id),
             ],
         ]);
     }
@@ -156,20 +160,32 @@ class MobileDashboardController extends Controller
             ->toArray();
     }
 
-    private function recentActivities(): array
+    private function recentActivities(int $userId): array
     {
         $activities = collect();
 
+        if ($userId <= 0) {
+            return [];
+        }
+
         if (Schema::hasTable('inbound_transactions')) {
+            $inboundQuery = DB::table('inbound_transactions')
+                ->select([
+                    'id',
+                    'transaction_number',
+                    'invoice_number',
+                    'transaction_date',
+                    'created_at',
+                ]);
+
+            // Filter per akun login.
+            // Kolom ini ada di transaksi mobile kamu karena saat store/update memakai submitted_by.
+            if (Schema::hasColumn('inbound_transactions', 'submitted_by')) {
+                $inboundQuery->where('submitted_by', $userId);
+            }
+
             $activities = $activities->merge(
-                DB::table('inbound_transactions')
-                    ->select([
-                        'id',
-                        'transaction_number',
-                        'invoice_number',
-                        'transaction_date',
-                        'created_at',
-                    ])
+                $inboundQuery
                     ->latest('created_at')
                     ->limit(5)
                     ->get()
@@ -180,7 +196,7 @@ class MobileDashboardController extends Controller
                             'qty' => $this->transactionQty(
                                 'inbound_transaction_items',
                                 'inbound_transaction_id',
-                                $row->id
+                                (int) $row->id
                             ),
                             'time' => Carbon::parse($row->transaction_date)->translatedFormat('d M Y'),
                             'created_at' => $row->created_at,
@@ -190,15 +206,23 @@ class MobileDashboardController extends Controller
         }
 
         if (Schema::hasTable('outbound_transactions')) {
+            $outboundQuery = DB::table('outbound_transactions')
+                ->select([
+                    'id',
+                    'transaction_number',
+                    'reference_number',
+                    'transaction_date',
+                    'created_at',
+                ]);
+
+            // Filter per akun login.
+            // Ini yang membuat akun A tidak bisa melihat aktivitas akun B.
+            if (Schema::hasColumn('outbound_transactions', 'submitted_by')) {
+                $outboundQuery->where('submitted_by', $userId);
+            }
+
             $activities = $activities->merge(
-                DB::table('outbound_transactions')
-                    ->select([
-                        'id',
-                        'transaction_number',
-                        'reference_number',
-                        'transaction_date',
-                        'created_at',
-                    ])
+                $outboundQuery
                     ->latest('created_at')
                     ->limit(5)
                     ->get()
@@ -209,7 +233,7 @@ class MobileDashboardController extends Controller
                             'qty' => $this->transactionQty(
                                 'outbound_transaction_items',
                                 'outbound_transaction_id',
-                                $row->id
+                                (int) $row->id
                             ),
                             'time' => Carbon::parse($row->transaction_date)->translatedFormat('d M Y'),
                             'created_at' => $row->created_at,
