@@ -2,14 +2,17 @@
 
 namespace Database\Seeders;
 
-use App\Models\Customer;
-use App\Models\ProductCategory;
-use App\Models\ProductDensity;
-use App\Models\ProductType;
-use App\Models\Supplier;
 use App\Models\Unit;
+use App\Models\Customer;
+use App\Models\Supplier;
 use App\Models\Warehouse;
+use App\Models\ProductType;
+use App\Models\ProductDensity;
+use App\Models\ProductCategory;
 use Illuminate\Database\Seeder;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Database\Seeders\ProductNauraSeeder;
 
 class InventoryMasterSeeder extends Seeder
 {
@@ -271,10 +274,60 @@ class InventoryMasterSeeder extends Seeder
         |--------------------------------------------------------------------------
         | Master Produk Naura
         |--------------------------------------------------------------------------
-        | Produk banyak diisi dari ProductNauraSeeder.
-        | Pastikan file ProductNauraSeeder.php sudah ada di database/seeders.
-        |--------------------------------------------------------------------------
         */
         $this->call(ProductNauraSeeder::class);
+
+        /*
+        |--------------------------------------------------------------------------
+        | Sinkronisasi Logo Produk
+        |--------------------------------------------------------------------------
+        | Wajib dijalankan setelah ProductNauraSeeder.
+        | Tujuannya agar produk umum seperti ALAR GOSOK, BANTAL, GULING,
+        | dan produk non-brand tidak ikut memakai logo QUANTUM.
+        */
+        $this->syncProductLogos();
+    }
+
+    private function syncProductLogos(): void
+    {
+        if (! Schema::hasTable('products') || ! Schema::hasColumn('products', 'logo_path')) {
+            return;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Reset Semua Logo
+        |--------------------------------------------------------------------------
+        | Default semua produk tanpa logo. Di mobile nanti otomatis tampil
+        | fallback huruf awal produk.
+        */
+        DB::table('products')->update([
+            'logo_path' => null,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | Logo Brand Produk
+        |--------------------------------------------------------------------------
+        | Hanya produk yang benar-benar mengandung brand di code/name/full_name
+        | yang diberi logo.
+        */
+        $brandLogos = [
+            'INOAC' => 'product/logos/Inoac.png',
+            'QUANTUM' => 'product/logos/quantum.png',
+        ];
+
+        foreach ($brandLogos as $brand => $logoPath) {
+            DB::table('products')
+                ->where(function ($query) use ($brand): void {
+                    $query
+                        ->where('code', 'like', "%{$brand}%")
+                        ->orWhere('name', 'like', "%{$brand}%")
+                        ->orWhere('full_name', 'like', "%{$brand}%");
+                })
+                ->update([
+                    'logo_path' => $logoPath,
+                ]);
+        }
     }
 }

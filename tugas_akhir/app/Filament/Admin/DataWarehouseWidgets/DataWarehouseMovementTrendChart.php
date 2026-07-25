@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Admin\Widgets;
+namespace App\Filament\Admin\DataWarehouseWidgets;
 
 use Carbon\Carbon;
 use Filament\Widgets\ChartWidget;
@@ -13,6 +13,8 @@ class DataWarehouseMovementTrendChart extends ChartWidget
     protected ?string $heading = 'Tren Qty Barang Masuk dan Keluar per Bulan';
 
     protected static ?int $sort = 3;
+
+    protected ?string $maxHeight = '300px';
 
     public string $period = 'all';
 
@@ -28,24 +30,11 @@ class DataWarehouseMovementTrendChart extends ChartWidget
 
     public ?string $productCategory = '';
 
+    protected ?string $pollingInterval = null;
+
     public static function canView(): bool
     {
-         $routeName = request()->route()?->getName();
-
-    if ($routeName === 'filament.admin.pages.data-warehouse-dashboard') {
         return true;
-    }
-
-    $referer = request()->headers->get('referer');
-
-    if (is_string($referer)) {
-        $path = parse_url($referer, PHP_URL_PATH);
-
-        return is_string($path)
-            && str_starts_with($path, '/admin/data-warehouse-dashboard');
-    }
-
-    return false;
     }
 
     protected function getData(): array
@@ -78,9 +67,11 @@ class DataWarehouseMovementTrendChart extends ChartWidget
                         ->map(fn ($value) => (float) $value)
                         ->toArray(),
                     'borderColor' => '#16a34a',
-                    'backgroundColor' => 'rgba(22, 163, 74, 0.18)',
+                    'backgroundColor' => 'rgba(22, 163, 74, 0.16)',
                     'tension' => 0.35,
                     'fill' => true,
+                    'pointRadius' => 3,
+                    'pointHoverRadius' => 5,
                 ],
                 [
                     'label' => 'Qty Barang Keluar',
@@ -88,9 +79,11 @@ class DataWarehouseMovementTrendChart extends ChartWidget
                         ->map(fn ($value) => (float) $value)
                         ->toArray(),
                     'borderColor' => '#dc2626',
-                    'backgroundColor' => 'rgba(220, 38, 38, 0.14)',
+                    'backgroundColor' => 'rgba(220, 38, 38, 0.10)',
                     'tension' => 0.35,
                     'fill' => true,
+                    'pointRadius' => 3,
+                    'pointHoverRadius' => 5,
                 ],
             ],
             'labels' => $rows->pluck('month_key')
@@ -102,6 +95,39 @@ class DataWarehouseMovementTrendChart extends ChartWidget
     protected function getType(): string
     {
         return 'line';
+    }
+
+    protected function getOptions(): array
+    {
+        return [
+            'responsive' => true,
+            'maintainAspectRatio' => false,
+            'plugins' => [
+                'legend' => [
+                    'position' => 'bottom',
+                    'labels' => [
+                        'boxWidth' => 12,
+                        'boxHeight' => 12,
+                    ],
+                ],
+                'tooltip' => [
+                    'enabled' => true,
+                ],
+            ],
+            'scales' => [
+                'x' => [
+                    'grid' => [
+                        'display' => false,
+                    ],
+                ],
+                'y' => [
+                    'beginAtZero' => true,
+                    'ticks' => [
+                        'precision' => 0,
+                    ],
+                ],
+            ],
+        ];
     }
 
     private function applyFilters(Builder $query): void

@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Api\Mobile;
 
-use App\Http\Controllers\Controller;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+use App\Http\Controllers\Controller;
 
 final class MobileOutboundController extends Controller
 {
@@ -101,6 +101,7 @@ final class MobileOutboundController extends Controller
             'outbound_type' => ['required', 'string', 'max:255'],
             'reference_number' => ['nullable', 'string', 'max:255'],
             'customer_id' => ['nullable', 'integer', 'exists:customers,id'],
+            'customer_name' => ['nullable', 'string', 'max:255'],
             'warehouse_id' => ['required', 'integer', 'exists:warehouses,id'],
             'sales_name' => ['nullable', 'string', 'max:255'],
             'driver_name' => ['nullable', 'string', 'max:255'],
@@ -128,6 +129,21 @@ final class MobileOutboundController extends Controller
 
         $transaction = DB::transaction(function () use ($request, $validated, $user) {
             $transactionNumber = $this->generateTransactionNumber();
+
+            $customerId = $this->resolveCustomerId(
+                isset($validated['customer_id']) ? (int) $validated['customer_id'] : null,
+                $validated['customer_name'] ?? null,
+            );
+
+            if ($customerId === null) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Nama customer / tujuan wajib diisi.',
+                    'errors' => [
+                        'customer_name' => ['Nama customer / tujuan wajib diisi.'],
+                    ],
+                ], 422));
+            }
 
             $warehouseId = (int) $validated['warehouse_id'];
 
@@ -200,7 +216,7 @@ final class MobileOutboundController extends Controller
                 'transaction_date' => $validated['transaction_date'],
                 'outbound_type' => $validated['outbound_type'],
                 'reference_number' => $validated['reference_number'] ?? null,
-                'customer_id' => $validated['customer_id'] ?? null,
+                'customer_id' => $customerId,
                 'warehouse_id' => $warehouseId,
                 'sales_name' => $validated['sales_name'] ?? null,
                 'driver_name' => $validated['driver_name'] ?? null,
@@ -318,6 +334,286 @@ final class MobileOutboundController extends Controller
         ], 201);
     }
 
+    public function update(Request $request, int $id): JsonResponse
+    {
+        $validated = $request->validate([
+            'transaction_date' => ['required', 'date'],
+            'outbound_type' => ['required', 'string', 'max:255'],
+            'reference_number' => ['nullable', 'string', 'max:255'],
+            'customer_id' => ['nullable', 'integer', 'exists:customers,id'],
+            'customer_name' => ['nullable', 'string', 'max:255'],
+            'warehouse_id' => ['required', 'integer', 'exists:warehouses,id'],
+            'sales_name' => ['nullable', 'string', 'max:255'],
+            'driver_name' => ['nullable', 'string', 'max:255'],
+            'due_date' => ['nullable', 'date'],
+            'note' => ['nullable', 'string'],
+
+            'discount_amount' => ['nullable', 'numeric', 'min:0'],
+            'vat_percent' => ['nullable', 'numeric', 'min:0'],
+            'vat_amount' => ['nullable', 'numeric', 'min:0'],
+            'other_cost' => ['nullable', 'numeric', 'min:0'],
+            'paid_amount' => ['nullable', 'numeric', 'min:0'],
+
+            'items' => ['required', 'array', 'min:1'],
+            'items.*.id' => ['nullable', 'integer'],
+            'items.*.product_id' => ['required', 'integer', 'exists:products,id'],
+            'items.*.warehouse_id' => ['nullable', 'integer', 'exists:warehouses,id'],
+            'items.*.stock_balance_id' => ['nullable', 'integer'],
+            'items.*.qty' => ['required', 'numeric', 'min:0.01'],
+            'items.*.unit_price' => ['nullable', 'numeric', 'min:0'],
+            'items.*.discount_amount' => ['nullable', 'numeric', 'min:0'],
+            'items.*.note' => ['nullable', 'string'],
+
+            'attachments' => ['nullable', 'array', 'max:3'],
+            'attachments.*' => ['file', 'mimes:jpg,jpeg,png,webp,pdf', 'max:5120'],
+        ]);
+
+        $user = $request->user();
+
+        $transaction = DB::table('outbound_transactions')
+            ->where('id', $id)
+            ->where('submitted_by', $user->id)
+            ->first();
+
+        if (! $transaction) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Data barang keluar tidak ditemukan.',
+            ], 404);
+        }
+
+        if ($transaction->status !== 'pending') {
+            return response()->json([
+                'success' => false,
+                'message' => 'Pengajuan barang keluar hanya bisa diedit saat status masih pending.',
+            ], 422);
+        }
+
+        $existingAttachmentCount = DB::table('outbound_transaction_attachments')
+            ->where('outbound_transaction_id', $id)
+            ->count();
+
+        $newAttachmentCount = $request->hasFile('attachments')
+            ? count($request->file('attachments'))
+            : 0;
+
+        if (($existingAttachmentCount + $newAttachmentCount) > 3) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Total lampiran maksimal 3 file. Hapus lampiran lama melalui dashboard admin atau jangan tambahkan lampiran baru.',
+            ], 422);
+        }
+
+        $updatedTransaction = DB::transaction(function () use ($request, $validated, $id, $user) {
+            $customerId = $this->resolveCustomerId(
+                isset($validated['customer_id']) ? (int) $validated['customer_id'] : null,
+                $validated['customer_name'] ?? null,
+            );
+
+            if ($customerId === null) {
+                abort(response()->json([
+                    'success' => false,
+                    'message' => 'Nama customer / tujuan wajib diisi.',
+                    'errors' => [
+                        'customer_name' => ['Nama customer / tujuan wajib diisi.'],
+                    ],
+                ], 422));
+            }
+
+            $warehouseId = (int) $validated['warehouse_id'];
+
+            $subTotal = 0;
+
+            foreach ($validated['items'] as $item) {
+                $product = DB::table('products')
+                    ->where('id', $item['product_id'])
+                    ->first([
+                        'id',
+                        'code',
+                        'name',
+                        'full_name',
+                        'unit_id',
+                        'last_selling_price',
+                        'default_selling_price',
+                    ]);
+
+                $qty = (float) $item['qty'];
+
+                $stockBalance = DB::table('stock_balances')
+                    ->where('product_id', $product->id)
+                    ->where('warehouse_id', $warehouseId)
+                    ->lockForUpdate()
+                    ->first(['qty_on_hand', 'qty_reserved']);
+
+                $qtyOnHand = $stockBalance ? (float) $stockBalance->qty_on_hand : 0;
+                $qtyReserved = $stockBalance ? (float) $stockBalance->qty_reserved : 0;
+                $availableQty = $qtyOnHand - $qtyReserved;
+
+                if ($qty > $availableQty) {
+                    abort(response()->json([
+                        'success' => false,
+                        'message' => 'Stok tidak mencukupi untuk produk '.$product->code.' - '.($product->full_name ?: $product->name).'.',
+                        'errors' => [
+                            'stock' => [
+                                'available_qty' => $availableQty,
+                                'requested_qty' => $qty,
+                            ],
+                        ],
+                    ], 422));
+                }
+
+                $unitPrice = isset($item['unit_price'])
+                    ? (float) $item['unit_price']
+                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+
+                $itemDiscount = isset($item['discount_amount'])
+                    ? (float) $item['discount_amount']
+                    : 0;
+
+                $subTotal += max(($qty * $unitPrice) - $itemDiscount, 0);
+            }
+
+            $discountAmount = isset($validated['discount_amount']) ? (float) $validated['discount_amount'] : 0;
+            $vatPercent = isset($validated['vat_percent']) ? (float) $validated['vat_percent'] : 0;
+            $manualVatAmount = isset($validated['vat_amount']) ? (float) $validated['vat_amount'] : 0;
+            $otherCost = isset($validated['other_cost']) ? (float) $validated['other_cost'] : 0;
+            $paidAmount = isset($validated['paid_amount']) ? (float) $validated['paid_amount'] : 0;
+
+            $vatAmount = $manualVatAmount > 0
+                ? $manualVatAmount
+                : max(($subTotal - $discountAmount) * ($vatPercent / 100), 0);
+
+            $grandTotal = max($subTotal - $discountAmount + $vatAmount + $otherCost, 0);
+            $remainingAmount = max($grandTotal - $paidAmount, 0);
+
+            DB::table('outbound_transactions')
+                ->where('id', $id)
+                ->where('submitted_by', $user->id)
+                ->update([
+                    'transaction_date' => $validated['transaction_date'],
+                    'outbound_type' => $validated['outbound_type'],
+                    'reference_number' => $validated['reference_number'] ?? null,
+                    'customer_id' => $customerId,
+                    'warehouse_id' => $warehouseId,
+                    'sales_name' => $validated['sales_name'] ?? null,
+                    'driver_name' => $validated['driver_name'] ?? null,
+                    'due_date' => $validated['due_date'] ?? null,
+                    'note' => $validated['note'] ?? null,
+                    'sub_total' => $subTotal,
+                    'discount_amount' => $discountAmount,
+                    'vat_percent' => $vatPercent,
+                    'vat_amount' => $vatAmount,
+                    'other_cost' => $otherCost,
+                    'grand_total' => $grandTotal,
+                    'paid_amount' => $paidAmount,
+                    'remaining_amount' => $remainingAmount,
+                    'updated_at' => now(),
+                ]);
+
+            DB::table('outbound_transaction_items')
+                ->where('outbound_transaction_id', $id)
+                ->delete();
+
+            foreach ($validated['items'] as $item) {
+                $product = DB::table('products')
+                    ->where('id', $item['product_id'])
+                    ->first([
+                        'id',
+                        'code',
+                        'name',
+                        'full_name',
+                        'unit_id',
+                        'last_selling_price',
+                        'default_selling_price',
+                    ]);
+
+                $stockBalance = DB::table('stock_balances')
+                    ->where('product_id', $product->id)
+                    ->where('warehouse_id', $warehouseId)
+                    ->first(['qty_on_hand', 'qty_reserved']);
+
+                $qtyOnHand = $stockBalance ? (float) $stockBalance->qty_on_hand : 0;
+                $qtyReserved = $stockBalance ? (float) $stockBalance->qty_reserved : 0;
+                $availableQty = $qtyOnHand - $qtyReserved;
+
+                $qty = (float) $item['qty'];
+
+                $unitPrice = isset($item['unit_price'])
+                    ? (float) $item['unit_price']
+                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+
+                $itemDiscount = isset($item['discount_amount'])
+                    ? (float) $item['discount_amount']
+                    : 0;
+
+                $subtotal = max(($qty * $unitPrice) - $itemDiscount, 0);
+
+                $unitName = null;
+
+                if ($product->unit_id) {
+                    $unitName = DB::table('units')
+                        ->where('id', $product->unit_id)
+                        ->value('name');
+                }
+
+                DB::table('outbound_transaction_items')->insert([
+                    'outbound_transaction_id' => $id,
+                    'product_id' => $product->id,
+                    'warehouse_id' => $warehouseId,
+                    'unit_id' => $product->unit_id,
+                    'qty' => $qty,
+                    'unit_price' => $unitPrice,
+                    'discount_amount' => $itemDiscount,
+                    'subtotal' => $subtotal,
+                    'stock_before_submit' => $availableQty,
+                    'stock_after_submit' => $availableQty - $qty,
+                    'product_code_snapshot' => $product->code,
+                    'product_name_snapshot' => $product->full_name ?: $product->name,
+                    'unit_name_snapshot' => $unitName,
+                    'note' => $item['note'] ?? null,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            }
+
+            if ($request->hasFile('attachments')) {
+                foreach ($request->file('attachments') as $file) {
+                    $path = $file->store('inventory/outbounds/'.$id, 'public');
+
+                    DB::table('outbound_transaction_attachments')->insert([
+                        'outbound_transaction_id' => $id,
+                        'file_path' => $path,
+                        'file_name' => $file->getClientOriginalName(),
+                        'mime_type' => $file->getClientMimeType(),
+                        'file_size' => $file->getSize(),
+                        'uploaded_by' => $user->id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ]);
+                }
+            }
+
+            return DB::table('outbound_transactions')
+                ->where('id', $id)
+                ->first();
+        });
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Pengajuan barang keluar berhasil diperbarui.',
+            'data' => [
+                'id' => $updatedTransaction->id,
+                'transaction_number' => $updatedTransaction->transaction_number,
+                'transaction_date' => $updatedTransaction->transaction_date,
+                'outbound_type' => $updatedTransaction->outbound_type,
+                'reference_number' => $updatedTransaction->reference_number,
+                'status' => $updatedTransaction->status,
+                'sub_total' => (float) $updatedTransaction->sub_total,
+                'grand_total' => (float) $updatedTransaction->grand_total,
+            ],
+        ]);
+    }
+
     public function show(Request $request, int $id): JsonResponse
     {
         $user = $request->user();
@@ -392,6 +688,7 @@ final class MobileOutboundController extends Controller
                 'products.name as current_product_name',
                 'products.full_name as current_product_full_name',
                 'products.size_text as product_size_text',
+                'products.logo_path as product_logo_path',
             ])
             ->map(function ($item): array {
                 return [
@@ -402,6 +699,10 @@ final class MobileOutboundController extends Controller
                     'product_code' => $item->product_code_snapshot ?: $item->current_product_code,
                     'product_name' => $item->product_name_snapshot ?: ($item->current_product_full_name ?: $item->current_product_name),
                     'product_size_text' => $item->product_size_text,
+                    'logo_path' => $item->product_logo_path,
+                    'product_logo_path' => $item->product_logo_path,
+                    'logo_url' => $this->productLogoUrl($item->product_logo_path),
+                    'product_logo_url' => $this->productLogoUrl($item->product_logo_path),
                     'unit_name' => $item->unit_name_snapshot,
                     'qty' => (float) $item->qty,
                     'unit_price' => (float) $item->unit_price,
@@ -486,6 +787,88 @@ final class MobileOutboundController extends Controller
                 'approval_note' => $transaction->approval_note,
             ],
         ]);
+    }
+
+    private function resolveCustomerId(?int $customerId, ?string $customerName): ?int
+    {
+        if ($customerId !== null && $customerId > 0) {
+            return $customerId;
+        }
+
+        $customerName = trim((string) $customerName);
+
+        if ($customerName === '') {
+            return null;
+        }
+
+        $existingId = DB::table('customers')
+            ->whereRaw('LOWER(name) = ?', [strtolower($customerName)])
+            ->value('id');
+
+        if ($existingId) {
+            return (int) $existingId;
+        }
+
+        $payload = [
+            'name' => $customerName,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+
+        if (DB::getSchemaBuilder()->hasColumn('customers', 'code')) {
+            $payload['code'] = $this->generateCustomerCode();
+        }
+
+        return (int) DB::table('customers')->insertGetId($payload);
+    }
+
+    private function generateCustomerCode(): string
+    {
+        do {
+            $code = 'CUS-MOB-'.now()->format('YmdHis').'-'.strtoupper(Str::random(4));
+            $exists = DB::table('customers')->where('code', $code)->exists();
+        } while ($exists);
+
+        return $code;
+    }
+
+    private function productLogoUrl(?string $logoPath): ?string
+    {
+        if ($logoPath === null || trim($logoPath) === '') {
+            return null;
+        }
+
+        $logoPath = trim($logoPath);
+        $logoPath = str_replace('\\', '/', $logoPath);
+
+        if (
+            str_starts_with($logoPath, 'http://') ||
+            str_starts_with($logoPath, 'https://')
+        ) {
+            return $logoPath;
+        }
+
+        $logoPath = ltrim($logoPath, '/');
+
+        if (str_starts_with($logoPath, 'public/')) {
+            $logoPath = substr($logoPath, strlen('public/'));
+        }
+
+        if (str_starts_with($logoPath, 'storage/')) {
+            $logoPath = substr($logoPath, strlen('storage/'));
+        }
+
+        $baseUrl = rtrim((string) config('app.url'), '/');
+
+        if (
+            $baseUrl === '' ||
+            str_contains($baseUrl, 'localhost') ||
+            str_contains($baseUrl, '127.0.0.1')
+        ) {
+            $baseUrl = rtrim(request()->getSchemeAndHttpHost(), '/');
+        }
+
+        return $baseUrl.'/storage/'.$logoPath;
     }
 
     private function generateTransactionNumber(): string

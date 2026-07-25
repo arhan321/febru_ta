@@ -2,10 +2,11 @@
 
 namespace App\Filament\Admin\Resources\InboundTransactions\Schemas;
 
-use Filament\Infolists\Components\TextEntry;
+use Filament\Schemas\Schema;
 use Filament\Schemas\Components\Grid;
 use Filament\Schemas\Components\Section;
-use Filament\Schemas\Schema;
+use Filament\Infolists\Components\TextEntry;
+use Filament\Infolists\Components\RepeatableEntry;
 
 class InboundTransactionInfolist
 {
@@ -54,6 +55,21 @@ class InboundTransactionInfolist
                                         'cancelled' => 'gray',
                                         default => 'gray',
                                     }),
+
+                                TextEntry::make('source')
+                                    ->label('Sumber')
+                                    ->badge()
+                                    ->formatStateUsing(fn (?string $state): string => match ($state) {
+                                        'import_excel' => 'Import Excel',
+                                        'import_database' => 'Import Database',
+                                        null, '' => 'Manual',
+                                        default => ucfirst(str_replace('_', ' ', $state)),
+                                    })
+                                    ->color(fn (?string $state): string => match ($state) {
+                                        'import_excel' => 'info',
+                                        'import_database' => 'warning',
+                                        default => 'gray',
+                                    }),
                             ]),
 
                         TextEntry::make('note')
@@ -61,6 +77,70 @@ class InboundTransactionInfolist
                             ->placeholder('-')
                             ->columnSpanFull(),
                     ]),
+
+                Section::make('Detail Item Barang Masuk')
+                    ->description('Menampilkan data item, termasuk data asli dari Excel seperti M3, Harga/M3, dan Jumlah Excel.')
+                    ->schema([
+                        RepeatableEntry::make('items')
+                            ->label('Daftar Item')
+                            ->schema([
+                                Grid::make(4)
+                                    ->schema([
+                                        TextEntry::make('product_code_snapshot')
+                                            ->label('Kode Barang')
+                                            ->placeholder('-'),
+
+                                        TextEntry::make('product_name_snapshot')
+                                            ->label('Nama Barang')
+                                            ->placeholder('-')
+                                            ->columnSpan(2),
+
+                                        TextEntry::make('unit_name_snapshot')
+                                            ->label('Satuan')
+                                            ->placeholder('-'),
+
+                                        TextEntry::make('qty')
+                                            ->label('QTY')
+                                            ->formatStateUsing(fn ($state): string => $state === null
+                                                ? '-'
+                                                : rtrim(rtrim(number_format((float) $state, 6, ',', '.'), '0'), ','))
+                                            ->badge(),
+
+                                        TextEntry::make('volume_m3')
+                                            ->label('M3 Excel')
+                                            ->formatStateUsing(fn ($state): string => $state === null
+                                                ? '-'
+                                                : rtrim(rtrim(number_format((float) $state, 6, ',', '.'), '0'), ',') . ' M³')
+                                            ->placeholder('-'),
+
+                                        TextEntry::make('price_per_m3')
+                                            ->label('Harga/M3 Excel')
+                                            ->money('IDR')
+                                            ->placeholder('-'),
+
+                                        TextEntry::make('excel_subtotal')
+                                            ->label('Jumlah Excel')
+                                            ->money('IDR')
+                                            ->placeholder('-'),
+
+                                        TextEntry::make('unit_cost')
+                                            ->label('Unit Cost Sistem')
+                                            ->money('IDR'),
+
+                                        TextEntry::make('subtotal')
+                                            ->label('Subtotal Sistem')
+                                            ->money('IDR')
+                                            ->weight('bold'),
+
+                                        TextEntry::make('note')
+                                            ->label('Catatan Item')
+                                            ->placeholder('-')
+                                            ->columnSpan(2),
+                                    ]),
+                            ])
+                            ->columnSpanFull(),
+                    ])
+                    ->collapsible(),
 
                 Section::make('Total Dokumen')
                     ->schema([

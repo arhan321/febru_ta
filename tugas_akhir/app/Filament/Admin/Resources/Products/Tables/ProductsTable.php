@@ -2,15 +2,16 @@
 
 namespace App\Filament\Admin\Resources\Products\Tables;
 
-use Filament\Actions\BulkActionGroup;
-use Filament\Actions\DeleteAction;
-use Filament\Actions\DeleteBulkAction;
+use Filament\Tables\Table;
 use Filament\Actions\EditAction;
+use Filament\Actions\DeleteAction;
+use Filament\Actions\BulkActionGroup;
+use Filament\Actions\DeleteBulkAction;
 use Filament\Tables\Columns\IconColumn;
 use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Columns\ImageColumn;
 use Filament\Tables\Filters\SelectFilter;
 use Filament\Tables\Filters\TernaryFilter;
-use Filament\Tables\Table;
 
 class ProductsTable
 {
@@ -23,6 +24,15 @@ class ProductsTable
                     ->badge()
                     ->searchable()
                     ->sortable(),
+
+                ImageColumn::make('logo_path')
+                    ->label('Logo')
+                    ->disk('public')
+                    ->height(42)
+                    ->width(78)
+                    ->extraImgAttributes([
+                        'style' => 'object-fit: contain; background-color: #ffffff; padding: 4px; border-radius: 8px;',
+                    ]),
 
                 TextColumn::make('name')
                     ->label('Produk')

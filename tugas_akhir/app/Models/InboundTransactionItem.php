@@ -13,6 +13,9 @@ class InboundTransactionItem extends Model
         'warehouse_id',
         'unit_id',
         'qty',
+        'volume_m3',
+        'price_per_m3',
+        'excel_subtotal',
         'unit_cost',
         'subtotal',
         'product_code_snapshot',
@@ -25,6 +28,9 @@ class InboundTransactionItem extends Model
         'qty' => 'decimal:2',
         'unit_cost' => 'decimal:2',
         'subtotal' => 'decimal:2',
+        'volume_m3' => 'decimal:6',
+        'price_per_m3' => 'decimal:2',
+        'excel_subtotal' => 'decimal:2',
     ];
 
     public function transaction(): BelongsTo

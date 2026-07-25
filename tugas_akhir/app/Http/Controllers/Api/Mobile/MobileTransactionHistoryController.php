@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Api\Mobile;
 
-use App\Http\Controllers\Controller;
-use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
+use App\Http\Controllers\Controller;
 
 final class MobileTransactionHistoryController extends Controller
 {
@@ -25,6 +25,7 @@ final class MobileTransactionHistoryController extends Controller
             $inbounds = DB::table('inbound_transactions')
                 ->leftJoin('suppliers', 'suppliers.id', '=', 'inbound_transactions.supplier_id')
                 ->join('warehouses', 'warehouses.id', '=', 'inbound_transactions.warehouse_id')
+                ->leftJoin('users as submitted_users', 'submitted_users.id', '=', 'inbound_transactions.submitted_by')
                 ->where('inbound_transactions.submitted_by', $user->id)
                 ->when($status, function ($query) use ($status): void {
                     $query->where('inbound_transactions.status', $status);
@@ -35,7 +36,9 @@ final class MobileTransactionHistoryController extends Controller
                             ->where('inbound_transactions.transaction_number', 'like', "%{$search}%")
                             ->orWhere('inbound_transactions.invoice_number', 'like', "%{$search}%")
                             ->orWhere('suppliers.name', 'like', "%{$search}%")
-                            ->orWhere('warehouses.name', 'like', "%{$search}%");
+                            ->orWhere('warehouses.name', 'like', "%{$search}%")
+                            ->orWhere('submitted_users.name', 'like', "%{$search}%")
+                            ->orWhere('submitted_users.email', 'like', "%{$search}%");
                     });
                 })
                 ->get([
@@ -46,6 +49,7 @@ final class MobileTransactionHistoryController extends Controller
                     'inbound_transactions.status',
                     'inbound_transactions.note',
                     'inbound_transactions.grand_total',
+                    'inbound_transactions.submitted_by',
                     'inbound_transactions.submitted_at',
                     'inbound_transactions.approved_at',
                     'inbound_transactions.rejected_at',
@@ -53,11 +57,17 @@ final class MobileTransactionHistoryController extends Controller
                     'inbound_transactions.created_at',
                     'suppliers.name as partner_name',
                     'warehouses.name as warehouse_name',
+                    'submitted_users.name as submitted_by_name',
+                    'submitted_users.email as submitted_by_email',
                 ])
                 ->map(function ($transaction): array {
                     $items = DB::table('inbound_transaction_items')
                         ->where('inbound_transaction_id', $transaction->id)
                         ->get(['qty']);
+
+                    $submittedByName = $transaction->submitted_by_name
+                        ?: $transaction->submitted_by_email
+                        ?: '-';
 
                     return [
                         'id' => $transaction->id,
@@ -75,6 +85,10 @@ final class MobileTransactionHistoryController extends Controller
                         'total_qty' => $items->sum(fn ($item) => (float) $item->qty),
                         'grand_total' => (float) $transaction->grand_total,
                         'note' => $transaction->note,
+                        'submitted_by' => $transaction->submitted_by,
+                        'submitted_by_name' => $submittedByName,
+                        'input_by_name' => $submittedByName,
+                        'created_by_name' => $submittedByName,
                         'submitted_at' => $transaction->submitted_at,
                         'approved_at' => $transaction->approved_at,
                         'rejected_at' => $transaction->rejected_at,
@@ -90,6 +104,7 @@ final class MobileTransactionHistoryController extends Controller
             $outbounds = DB::table('outbound_transactions')
                 ->leftJoin('customers', 'customers.id', '=', 'outbound_transactions.customer_id')
                 ->join('warehouses', 'warehouses.id', '=', 'outbound_transactions.warehouse_id')
+                ->leftJoin('users as submitted_users', 'submitted_users.id', '=', 'outbound_transactions.submitted_by')
                 ->where('outbound_transactions.submitted_by', $user->id)
                 ->when($status, function ($query) use ($status): void {
                     $query->where('outbound_transactions.status', $status);
@@ -100,7 +115,9 @@ final class MobileTransactionHistoryController extends Controller
                             ->where('outbound_transactions.transaction_number', 'like', "%{$search}%")
                             ->orWhere('outbound_transactions.reference_number', 'like', "%{$search}%")
                             ->orWhere('customers.name', 'like', "%{$search}%")
-                            ->orWhere('warehouses.name', 'like', "%{$search}%");
+                            ->orWhere('warehouses.name', 'like', "%{$search}%")
+                            ->orWhere('submitted_users.name', 'like', "%{$search}%")
+                            ->orWhere('submitted_users.email', 'like', "%{$search}%");
                     });
                 })
                 ->get([
@@ -112,6 +129,7 @@ final class MobileTransactionHistoryController extends Controller
                     'outbound_transactions.status',
                     'outbound_transactions.note',
                     'outbound_transactions.grand_total',
+                    'outbound_transactions.submitted_by',
                     'outbound_transactions.submitted_at',
                     'outbound_transactions.approved_at',
                     'outbound_transactions.rejected_at',
@@ -119,11 +137,17 @@ final class MobileTransactionHistoryController extends Controller
                     'outbound_transactions.created_at',
                     'customers.name as partner_name',
                     'warehouses.name as warehouse_name',
+                    'submitted_users.name as submitted_by_name',
+                    'submitted_users.email as submitted_by_email',
                 ])
                 ->map(function ($transaction): array {
                     $items = DB::table('outbound_transaction_items')
                         ->where('outbound_transaction_id', $transaction->id)
                         ->get(['qty']);
+
+                    $submittedByName = $transaction->submitted_by_name
+                        ?: $transaction->submitted_by_email
+                        ?: '-';
 
                     return [
                         'id' => $transaction->id,
@@ -142,6 +166,10 @@ final class MobileTransactionHistoryController extends Controller
                         'total_qty' => $items->sum(fn ($item) => (float) $item->qty),
                         'grand_total' => (float) $transaction->grand_total,
                         'note' => $transaction->note,
+                        'submitted_by' => $transaction->submitted_by,
+                        'submitted_by_name' => $submittedByName,
+                        'input_by_name' => $submittedByName,
+                        'created_by_name' => $submittedByName,
                         'submitted_at' => $transaction->submitted_at,
                         'approved_at' => $transaction->approved_at,
                         'rejected_at' => $transaction->rejected_at,

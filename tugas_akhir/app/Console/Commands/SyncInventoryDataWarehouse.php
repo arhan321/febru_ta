@@ -2,22 +2,23 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Customer;
-use App\Models\InboundTransaction;
-use App\Models\OutboundTransaction;
-use App\Models\Product;
-use App\Models\StockBalance;
-use App\Models\StockMovement;
-use App\Models\Supplier;
+use Throwable;
+use Carbon\Carbon;
 use App\Models\User;
-use App\Models\Warehouse;
 use App\Models\Asset;
+use App\Models\Product;
+use App\Models\Customer;
+use App\Models\Supplier;
+use App\Models\Warehouse;
+use App\Models\StockBalance;
 use App\Models\AssetCategory;
 use App\Models\AssetLocation;
-use Carbon\Carbon;
+use App\Models\StockMovement;
 use Illuminate\Console\Command;
+use App\Models\InboundTransaction;
 use Illuminate\Support\Facades\DB;
-use Throwable;
+use App\Models\OutboundTransaction;
+use Illuminate\Support\Facades\Schema;
 
 class SyncInventoryDataWarehouse extends Command
 {
@@ -65,9 +66,9 @@ class SyncInventoryDataWarehouse extends Command
     {
         $this->info('Syncing facts...');
 
-        $this->syncFactInventoryMovements();
         $this->syncFactInboundTransactions();
         $this->syncFactOutboundTransactions();
+        $this->syncFactInventoryMovements();
         $this->syncFactStockSnapshots();
         $this->syncFactAssetSnapshots();
     }
@@ -80,7 +81,7 @@ class SyncInventoryDataWarehouse extends Command
                 foreach ($products as $product) {
                     DB::table('dw_dim_products')->updateOrInsert(
                         ['source_product_id' => $product->id],
-                        [
+                        $this->filterColumns('dw_dim_products', [
                             'code' => $product->code,
                             'name' => $product->name,
                             'full_name' => $product->full_name,
@@ -93,7 +94,7 @@ class SyncInventoryDataWarehouse extends Command
                             'is_active' => (bool) ($product->is_active ?? true),
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -106,7 +107,7 @@ class SyncInventoryDataWarehouse extends Command
                 foreach ($warehouses as $warehouse) {
                     DB::table('dw_dim_warehouses')->updateOrInsert(
                         ['source_warehouse_id' => $warehouse->id],
-                        [
+                        $this->filterColumns('dw_dim_warehouses', [
                             'code' => $warehouse->code,
                             'name' => $warehouse->name,
                             'address' => $warehouse->address,
@@ -114,7 +115,7 @@ class SyncInventoryDataWarehouse extends Command
                             'is_active' => (bool) ($warehouse->is_active ?? true),
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -127,7 +128,7 @@ class SyncInventoryDataWarehouse extends Command
                 foreach ($suppliers as $supplier) {
                     DB::table('dw_dim_suppliers')->updateOrInsert(
                         ['source_supplier_id' => $supplier->id],
-                        [
+                        $this->filterColumns('dw_dim_suppliers', [
                             'code' => $supplier->code,
                             'name' => $supplier->name,
                             'phone' => $supplier->phone,
@@ -135,7 +136,7 @@ class SyncInventoryDataWarehouse extends Command
                             'is_active' => (bool) ($supplier->is_active ?? true),
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -148,7 +149,7 @@ class SyncInventoryDataWarehouse extends Command
                 foreach ($customers as $customer) {
                     DB::table('dw_dim_customers')->updateOrInsert(
                         ['source_customer_id' => $customer->id],
-                        [
+                        $this->filterColumns('dw_dim_customers', [
                             'code' => $customer->code,
                             'name' => $customer->name,
                             'phone' => $customer->phone,
@@ -157,7 +158,7 @@ class SyncInventoryDataWarehouse extends Command
                             'is_active' => (bool) ($customer->is_active ?? true),
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -171,7 +172,7 @@ class SyncInventoryDataWarehouse extends Command
                 foreach ($users as $user) {
                     DB::table('dw_dim_users')->updateOrInsert(
                         ['source_user_id' => $user->id],
-                        [
+                        $this->filterColumns('dw_dim_users', [
                             'name' => $user->name,
                             'email' => $user->email,
                             'username' => $user->profile?->username,
@@ -181,7 +182,7 @@ class SyncInventoryDataWarehouse extends Command
                             'is_active' => (bool) ($user->profile?->is_active ?? true),
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -189,7 +190,264 @@ class SyncInventoryDataWarehouse extends Command
 
     private function syncFactInventoryMovements(): void
     {
+        /*
+         * Jangan hanya membaca stock_movements.
+         * Data histori lama dengan Update Stok Operasional OFF tidak membuat stock_movements,
+         * tetapi tetap tersimpan di inbound/outbound transaction items dan harus masuk chart DW.
+         */
+        if (! Schema::hasTable('dw_fact_inventory_movements')) {
+            return;
+        }
+
+        DB::table('dw_fact_inventory_movements')->delete();
+
+        $this->syncInboundTransactionItemsAsInventoryMovements();
+        $this->syncOutboundTransactionItemsAsInventoryMovements();
+        $this->syncOtherStockMovementsAsInventoryMovements();
+    }
+
+    private function syncInboundTransactionItemsAsInventoryMovements(): void
+    {
+        if (! Schema::hasTable('inbound_transactions') || ! Schema::hasTable('inbound_transaction_items')) {
+            return;
+        }
+
+        $warehouseExpression = $this->warehouseExpression(
+            'inbound_transaction_items',
+            'inbound_transactions',
+            'item',
+            'trx'
+        );
+
+        if (! $warehouseExpression) {
+            return;
+        }
+
+        $select = [
+            'item.id as item_id',
+            'item.inbound_transaction_id as transaction_id',
+            'item.product_id',
+            DB::raw($warehouseExpression . ' as warehouse_id'),
+            'item.qty',
+            'item.created_at as item_created_at',
+            'trx.transaction_number',
+            'trx.transaction_date',
+            'trx.created_at as transaction_created_at',
+        ];
+
+        if (Schema::hasColumn('inbound_transactions', 'invoice_number')) {
+            $select[] = 'trx.invoice_number';
+        } else {
+            $select[] = DB::raw('NULL as invoice_number');
+        }
+
+        if (Schema::hasColumn('inbound_transactions', 'submitted_by')) {
+            $select[] = 'trx.submitted_by';
+        } else {
+            $select[] = DB::raw('NULL as submitted_by');
+        }
+
+        if (Schema::hasColumn('inbound_transactions', 'approved_by')) {
+            $select[] = 'trx.approved_by';
+        } else {
+            $select[] = DB::raw('NULL as approved_by');
+        }
+
+        $query = DB::table('inbound_transaction_items as item')
+            ->join('inbound_transactions as trx', 'trx.id', '=', 'item.inbound_transaction_id')
+            ->whereNotNull('item.product_id')
+            ->where('item.qty', '>', 0)
+            ->whereRaw($warehouseExpression . ' IS NOT NULL')
+            ->orderBy('trx.transaction_date')
+            ->orderBy('trx.id')
+            ->orderBy('item.id')
+            ->select($select);
+
+        $this->applyDataWarehouseTransactionStatusFilter($query, 'inbound_transactions', 'trx');
+
+        foreach ($query->get() as $row) {
+            $date = $this->dateFromTransaction(
+                $row->transaction_date,
+                $row->transaction_created_at,
+                $row->item_created_at
+            );
+
+            $dateKey = $this->ensureDateDimension($date);
+            $productDimId = $this->getProductDimId((int) $row->product_id);
+            $warehouseDimId = $this->getWarehouseDimId((int) $row->warehouse_id);
+
+            $userDimId = $row->approved_by
+                ? $this->getUserDimId((int) $row->approved_by)
+                : ($row->submitted_by ? $this->getUserDimId((int) $row->submitted_by) : null);
+
+            if (! $productDimId || ! $warehouseDimId) {
+                continue;
+            }
+
+            $qty = (float) $row->qty;
+            $movementNumber = 'DW-IN-ITEM-' . $row->item_id;
+            $sourceStockMovementId = $this->syntheticSourceStockMovementId('in', (int) $row->item_id);
+
+            $this->upsertInventoryMovement(
+                $this->inventoryMovementUniqueKey($movementNumber, $sourceStockMovementId),
+                [
+                    'source_stock_movement_id' => $sourceStockMovementId,
+                    'movement_number' => $movementNumber,
+                    'movement_type' => 'in',
+                    'date_key' => $dateKey,
+                    'product_dim_id' => $productDimId,
+                    'warehouse_dim_id' => $warehouseDimId,
+                    'user_dim_id' => $userDimId,
+                    'qty_in' => $qty,
+                    'qty_out' => 0,
+                    'stock_before' => 0,
+                    'stock_after' => 0,
+                    'reference_type' => 'inbound_transaction',
+                    'reference_id' => (int) $row->transaction_id,
+                    'description' => 'ETL barang masuk dari transaksi ' . ($row->transaction_number ?? $row->invoice_number ?? '-'),
+                    'movement_created_at' => $date,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]
+            );
+        }
+    }
+
+    private function syncOutboundTransactionItemsAsInventoryMovements(): void
+    {
+        if (! Schema::hasTable('outbound_transactions') || ! Schema::hasTable('outbound_transaction_items')) {
+            return;
+        }
+
+        $warehouseExpression = $this->warehouseExpression(
+            'outbound_transaction_items',
+            'outbound_transactions',
+            'item',
+            'trx'
+        );
+
+        if (! $warehouseExpression) {
+            return;
+        }
+
+        $select = [
+            'item.id as item_id',
+            'item.outbound_transaction_id as transaction_id',
+            'item.product_id',
+            DB::raw($warehouseExpression . ' as warehouse_id'),
+            'item.qty',
+            'item.created_at as item_created_at',
+            'trx.transaction_number',
+            'trx.transaction_date',
+            'trx.created_at as transaction_created_at',
+        ];
+
+        if (Schema::hasColumn('outbound_transaction_items', 'stock_before_submit')) {
+            $select[] = 'item.stock_before_submit';
+        } else {
+            $select[] = DB::raw('0 as stock_before_submit');
+        }
+
+        if (Schema::hasColumn('outbound_transaction_items', 'stock_after_submit')) {
+            $select[] = 'item.stock_after_submit';
+        } else {
+            $select[] = DB::raw('0 as stock_after_submit');
+        }
+
+        if (Schema::hasColumn('outbound_transactions', 'reference_number')) {
+            $select[] = 'trx.reference_number';
+        } else {
+            $select[] = DB::raw('NULL as reference_number');
+        }
+
+        if (Schema::hasColumn('outbound_transactions', 'submitted_by')) {
+            $select[] = 'trx.submitted_by';
+        } else {
+            $select[] = DB::raw('NULL as submitted_by');
+        }
+
+        if (Schema::hasColumn('outbound_transactions', 'approved_by')) {
+            $select[] = 'trx.approved_by';
+        } else {
+            $select[] = DB::raw('NULL as approved_by');
+        }
+
+        $query = DB::table('outbound_transaction_items as item')
+            ->join('outbound_transactions as trx', 'trx.id', '=', 'item.outbound_transaction_id')
+            ->whereNotNull('item.product_id')
+            ->where('item.qty', '>', 0)
+            ->whereRaw($warehouseExpression . ' IS NOT NULL')
+            ->orderBy('trx.transaction_date')
+            ->orderBy('trx.id')
+            ->orderBy('item.id')
+            ->select($select);
+
+        $this->applyDataWarehouseTransactionStatusFilter($query, 'outbound_transactions', 'trx');
+
+        foreach ($query->get() as $row) {
+            $date = $this->dateFromTransaction(
+                $row->transaction_date,
+                $row->transaction_created_at,
+                $row->item_created_at
+            );
+
+            $dateKey = $this->ensureDateDimension($date);
+            $productDimId = $this->getProductDimId((int) $row->product_id);
+            $warehouseDimId = $this->getWarehouseDimId((int) $row->warehouse_id);
+
+            $userDimId = $row->approved_by
+                ? $this->getUserDimId((int) $row->approved_by)
+                : ($row->submitted_by ? $this->getUserDimId((int) $row->submitted_by) : null);
+
+            if (! $productDimId || ! $warehouseDimId) {
+                continue;
+            }
+
+            $qty = (float) $row->qty;
+            $movementNumber = 'DW-OUT-ITEM-' . $row->item_id;
+            $sourceStockMovementId = $this->syntheticSourceStockMovementId('out', (int) $row->item_id);
+
+            $this->upsertInventoryMovement(
+                $this->inventoryMovementUniqueKey($movementNumber, $sourceStockMovementId),
+                [
+                    'source_stock_movement_id' => $sourceStockMovementId,
+                    'movement_number' => $movementNumber,
+                    'movement_type' => 'out',
+                    'date_key' => $dateKey,
+                    'product_dim_id' => $productDimId,
+                    'warehouse_dim_id' => $warehouseDimId,
+                    'user_dim_id' => $userDimId,
+                    'qty_in' => 0,
+                    'qty_out' => $qty,
+                    'stock_before' => (float) ($row->stock_before_submit ?? 0),
+                    'stock_after' => (float) ($row->stock_after_submit ?? 0),
+                    'reference_type' => 'outbound_transaction',
+                    'reference_id' => (int) $row->transaction_id,
+                    'description' => 'ETL barang keluar dari transaksi ' . ($row->transaction_number ?? $row->reference_number ?? '-'),
+                    'movement_created_at' => $date,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]
+            );
+        }
+    }
+
+    private function syncOtherStockMovementsAsInventoryMovements(): void
+    {
+        if (! Schema::hasTable('stock_movements')) {
+            return;
+        }
+
         StockMovement::query()
+            ->where(function ($query): void {
+                $query->whereNull('reference_type')
+                    ->orWhereNotIn('reference_type', [
+                        'inbound_transaction',
+                        'outbound_transaction',
+                        InboundTransaction::class,
+                        OutboundTransaction::class,
+                    ]);
+            })
             ->chunkById(200, function ($movements): void {
                 foreach ($movements as $movement) {
                     $date = $movement->created_at ?? now();
@@ -202,7 +460,7 @@ class SyncInventoryDataWarehouse extends Command
                         continue;
                     }
 
-                    $movementType = strtoupper((string) $movement->movement_type);
+                    $movementType = strtolower((string) $movement->movement_type);
 
                     $qty = (float) (
                         $movement->qty
@@ -216,11 +474,11 @@ class SyncInventoryDataWarehouse extends Command
                     $qtyOut = (float) ($movement->qty_out ?? 0);
 
                     if ($qtyIn <= 0 && $qtyOut <= 0) {
-                        if (in_array($movementType, ['IN', 'MASUK', 'INBOUND'], true)) {
+                        if (in_array($movementType, ['in', 'masuk', 'inbound'], true)) {
                             $qtyIn = $qty;
                         }
 
-                        if (in_array($movementType, ['OUT', 'KELUAR', 'OUTBOUND'], true)) {
+                        if (in_array($movementType, ['out', 'keluar', 'outbound'], true)) {
                             $qtyOut = $qty;
                         }
                     }
@@ -231,27 +489,27 @@ class SyncInventoryDataWarehouse extends Command
                         ?? null;
 
                     $userDimId = $userId ? $this->getUserDimId((int) $userId) : null;
+                    $movementNumber = $movement->movement_number ?: 'DW-STOCK-MOVEMENT-' . $movement->id;
 
-                    DB::table('dw_fact_inventory_movements')->updateOrInsert(
-                        ['source_stock_movement_id' => $movement->id],
+                    $this->upsertInventoryMovement(
+                        Schema::hasColumn('dw_fact_inventory_movements', 'source_stock_movement_id')
+                            ? ['source_stock_movement_id' => $movement->id]
+                            : $this->inventoryMovementUniqueKey($movementNumber, (int) $movement->id),
                         [
-                            'movement_number' => $movement->movement_number ?? null,
+                            'source_stock_movement_id' => $movement->id,
+                            'movement_number' => $movementNumber,
                             'movement_type' => $movement->movement_type,
-
                             'date_key' => $dateKey,
                             'product_dim_id' => $productDimId,
                             'warehouse_dim_id' => $warehouseDimId,
                             'user_dim_id' => $userDimId,
-
                             'qty_in' => $qtyIn,
                             'qty_out' => $qtyOut,
                             'stock_before' => (float) ($movement->stock_before ?? 0),
                             'stock_after' => (float) ($movement->stock_after ?? 0),
-
                             'reference_type' => $movement->reference_type ?? null,
                             'reference_id' => $movement->reference_id ?? null,
                             'description' => $movement->description ?? $movement->note ?? null,
-
                             'movement_created_at' => $movement->created_at,
                             'created_at' => now(),
                             'updated_at' => now(),
@@ -271,6 +529,7 @@ class SyncInventoryDataWarehouse extends Command
                     $dateKey = $this->ensureDateDimension($date);
 
                     $warehouseDimId = $this->getWarehouseDimId((int) $transaction->warehouse_id);
+
                     $supplierDimId = $transaction->supplier_id
                         ? $this->getSupplierDimId((int) $transaction->supplier_id)
                         : null;
@@ -289,33 +548,28 @@ class SyncInventoryDataWarehouse extends Command
 
                     DB::table('dw_fact_inbound_transactions')->updateOrInsert(
                         ['source_inbound_id' => $transaction->id],
-                        [
+                        $this->filterColumns('dw_fact_inbound_transactions', [
                             'transaction_number' => $transaction->transaction_number,
                             'invoice_number' => $transaction->invoice_number,
-
                             'date_key' => $dateKey,
                             'warehouse_dim_id' => $warehouseDimId,
                             'supplier_dim_id' => $supplierDimId,
                             'submitted_user_dim_id' => $submittedUserDimId,
                             'approved_user_dim_id' => $approvedUserDimId,
-
                             'total_items' => $transaction->items->count(),
                             'total_qty' => (float) $transaction->items->sum('qty'),
                             'sub_total' => (float) ($transaction->sub_total ?? 0),
                             'discount_amount' => (float) ($transaction->discount_amount ?? 0),
                             'other_cost' => (float) ($transaction->other_cost ?? 0),
                             'grand_total' => (float) ($transaction->grand_total ?? 0),
-
                             'status' => $transaction->status,
                             'source' => $transaction->source,
-
                             'submitted_at' => $transaction->submitted_at,
                             'approved_at' => $transaction->approved_at,
                             'transaction_created_at' => $transaction->created_at,
-
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -331,6 +585,7 @@ class SyncInventoryDataWarehouse extends Command
                     $dateKey = $this->ensureDateDimension($date);
 
                     $warehouseDimId = $this->getWarehouseDimId((int) $transaction->warehouse_id);
+
                     $customerDimId = $transaction->customer_id
                         ? $this->getCustomerDimId((int) $transaction->customer_id)
                         : null;
@@ -349,17 +604,15 @@ class SyncInventoryDataWarehouse extends Command
 
                     DB::table('dw_fact_outbound_transactions')->updateOrInsert(
                         ['source_outbound_id' => $transaction->id],
-                        [
+                        $this->filterColumns('dw_fact_outbound_transactions', [
                             'transaction_number' => $transaction->transaction_number,
                             'reference_number' => $transaction->reference_number,
                             'outbound_type' => $transaction->outbound_type,
-
                             'date_key' => $dateKey,
                             'warehouse_dim_id' => $warehouseDimId,
                             'customer_dim_id' => $customerDimId,
                             'submitted_user_dim_id' => $submittedUserDimId,
                             'approved_user_dim_id' => $approvedUserDimId,
-
                             'total_items' => $transaction->items->count(),
                             'total_qty' => (float) $transaction->items->sum('qty'),
                             'sub_total' => (float) ($transaction->sub_total ?? 0),
@@ -369,17 +622,14 @@ class SyncInventoryDataWarehouse extends Command
                             'grand_total' => (float) ($transaction->grand_total ?? 0),
                             'paid_amount' => (float) ($transaction->paid_amount ?? 0),
                             'remaining_amount' => (float) ($transaction->remaining_amount ?? 0),
-
                             'status' => $transaction->status,
                             'source' => $transaction->source,
-
                             'submitted_at' => $transaction->submitted_at,
                             'approved_at' => $transaction->approved_at,
                             'transaction_created_at' => $transaction->created_at,
-
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
@@ -417,7 +667,7 @@ class SyncInventoryDataWarehouse extends Command
                             'product_dim_id' => $productDimId,
                             'warehouse_dim_id' => $warehouseDimId,
                         ],
-                        [
+                        $this->filterColumns('dw_fact_stock_snapshots', [
                             'qty_on_hand' => $qtyOnHand,
                             'qty_reserved' => $qtyReserved,
                             'qty_available' => $qtyAvailable,
@@ -426,144 +676,131 @@ class SyncInventoryDataWarehouse extends Command
                             'snapshot_at' => $snapshotDate,
                             'created_at' => now(),
                             'updated_at' => now(),
-                        ]
+                        ])
                     );
                 }
             });
     }
 
     private function syncDimAssetCategories(): void
-{
-    AssetCategory::query()
-        ->chunkById(200, function ($categories): void {
-            foreach ($categories as $category) {
-                DB::table('dw_dim_asset_categories')->updateOrInsert(
-                    [
-                        'source_asset_category_id' => $category->id,
-                    ],
-                    [
-                        'code' => $category->code,
-                        'name' => $category->name,
-                        'is_active' => (bool) ($category->is_active ?? true),
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]
-                );
-            }
-        });
-}
-
-private function syncDimAssetLocations(): void
-{
-    AssetLocation::query()
-        ->chunkById(200, function ($locations): void {
-            foreach ($locations as $location) {
-                DB::table('dw_dim_asset_locations')->updateOrInsert(
-                    [
-                        'source_asset_location_id' => $location->id,
-                    ],
-                    [
-                        'code' => $location->code,
-                        'name' => $location->name,
-                        'address' => $location->address,
-                        'is_active' => (bool) ($location->is_active ?? true),
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]
-                );
-            }
-        });
-}
-
-private function syncDimAssets(): void
-{
-    Asset::query()
-        ->with(['category', 'location'])
-        ->chunkById(200, function ($assets): void {
-            foreach ($assets as $asset) {
-                $categoryDimId = $asset->asset_category_id
-                    ? $this->getAssetCategoryDimId((int) $asset->asset_category_id)
-                    : null;
-
-                $locationDimId = $asset->asset_location_id
-                    ? $this->getAssetLocationDimId((int) $asset->asset_location_id)
-                    : null;
-
-                DB::table('dw_dim_assets')->updateOrInsert(
-                    [
-                        'source_asset_id' => $asset->id,
-                    ],
-                    [
-                        'asset_category_dim_id' => $categoryDimId,
-                        'asset_location_dim_id' => $locationDimId,
-
-                        'asset_code' => $asset->asset_code,
-                        'name' => $asset->name,
-                        'license_plate' => $asset->license_plate,
-
-                        'brand' => $asset->brand,
-                        'model' => $asset->model,
-                        'serial_number' => $asset->serial_number,
-
-                        'acquisition_year' => $asset->acquisition_year,
-                        'acquisition_date' => $asset->acquisition_date,
-                        'acquisition_price' => (float) ($asset->acquisition_price ?? 0),
-
-                        'condition' => $asset->condition,
-                        'status' => $asset->status,
-
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]
-                );
-            }
-        });
-}
-
-private function syncFactAssetSnapshots(): void
-{
-    $snapshotDate = now();
-    $dateKey = $this->ensureDateDimension($snapshotDate);
-
-    Asset::query()
-        ->chunkById(200, function ($assets) use ($dateKey, $snapshotDate): void {
-            foreach ($assets as $asset) {
-                $assetDimId = $this->getAssetDimId((int) $asset->id);
-
-                if (! $assetDimId) {
-                    continue;
+    {
+        AssetCategory::query()
+            ->chunkById(200, function ($categories): void {
+                foreach ($categories as $category) {
+                    DB::table('dw_dim_asset_categories')->updateOrInsert(
+                        ['source_asset_category_id' => $category->id],
+                        $this->filterColumns('dw_dim_asset_categories', [
+                            'code' => $category->code,
+                            'name' => $category->name,
+                            'is_active' => (bool) ($category->is_active ?? true),
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ])
+                    );
                 }
+            });
+    }
 
-                $categoryDimId = $asset->asset_category_id
-                    ? $this->getAssetCategoryDimId((int) $asset->asset_category_id)
-                    : null;
+    private function syncDimAssetLocations(): void
+    {
+        AssetLocation::query()
+            ->chunkById(200, function ($locations): void {
+                foreach ($locations as $location) {
+                    DB::table('dw_dim_asset_locations')->updateOrInsert(
+                        ['source_asset_location_id' => $location->id],
+                        $this->filterColumns('dw_dim_asset_locations', [
+                            'code' => $location->code,
+                            'name' => $location->name,
+                            'address' => $location->address,
+                            'is_active' => (bool) ($location->is_active ?? true),
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ])
+                    );
+                }
+            });
+    }
 
-                $locationDimId = $asset->asset_location_id
-                    ? $this->getAssetLocationDimId((int) $asset->asset_location_id)
-                    : null;
+    private function syncDimAssets(): void
+    {
+        Asset::query()
+            ->with(['category', 'location'])
+            ->chunkById(200, function ($assets): void {
+                foreach ($assets as $asset) {
+                    $categoryDimId = $asset->asset_category_id
+                        ? $this->getAssetCategoryDimId((int) $asset->asset_category_id)
+                        : null;
 
-                DB::table('dw_fact_asset_snapshots')->updateOrInsert(
-                    [
-                        'date_key' => $dateKey,
-                        'asset_dim_id' => $assetDimId,
-                    ],
-                    [
-                        'asset_category_dim_id' => $categoryDimId,
-                        'asset_location_dim_id' => $locationDimId,
+                    $locationDimId = $asset->asset_location_id
+                        ? $this->getAssetLocationDimId((int) $asset->asset_location_id)
+                        : null;
 
-                        'acquisition_price' => (float) ($asset->acquisition_price ?? 0),
-                        'condition' => $asset->condition,
-                        'status' => $asset->status,
-                        'is_active' => $asset->status !== 'tidak_aktif',
+                    DB::table('dw_dim_assets')->updateOrInsert(
+                        ['source_asset_id' => $asset->id],
+                        $this->filterColumns('dw_dim_assets', [
+                            'asset_category_dim_id' => $categoryDimId,
+                            'asset_location_dim_id' => $locationDimId,
+                            'asset_code' => $asset->asset_code,
+                            'name' => $asset->name,
+                            'license_plate' => $asset->license_plate,
+                            'brand' => $asset->brand,
+                            'model' => $asset->model,
+                            'serial_number' => $asset->serial_number,
+                            'acquisition_year' => $asset->acquisition_year,
+                            'acquisition_date' => $asset->acquisition_date,
+                            'acquisition_price' => (float) ($asset->acquisition_price ?? 0),
+                            'condition' => $asset->condition,
+                            'status' => $asset->status,
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ])
+                    );
+                }
+            });
+    }
 
-                        'snapshot_at' => $snapshotDate,
-                        'created_at' => now(),
-                        'updated_at' => now(),
-                    ]
-                );
-            }
-        });
-}
+    private function syncFactAssetSnapshots(): void
+    {
+        $snapshotDate = now();
+        $dateKey = $this->ensureDateDimension($snapshotDate);
+
+        Asset::query()
+            ->chunkById(200, function ($assets) use ($dateKey, $snapshotDate): void {
+                foreach ($assets as $asset) {
+                    $assetDimId = $this->getAssetDimId((int) $asset->id);
+
+                    if (! $assetDimId) {
+                        continue;
+                    }
+
+                    $categoryDimId = $asset->asset_category_id
+                        ? $this->getAssetCategoryDimId((int) $asset->asset_category_id)
+                        : null;
+
+                    $locationDimId = $asset->asset_location_id
+                        ? $this->getAssetLocationDimId((int) $asset->asset_location_id)
+                        : null;
+
+                    DB::table('dw_fact_asset_snapshots')->updateOrInsert(
+                        [
+                            'date_key' => $dateKey,
+                            'asset_dim_id' => $assetDimId,
+                        ],
+                        $this->filterColumns('dw_fact_asset_snapshots', [
+                            'asset_category_dim_id' => $categoryDimId,
+                            'asset_location_dim_id' => $locationDimId,
+                            'acquisition_price' => (float) ($asset->acquisition_price ?? 0),
+                            'condition' => $asset->condition,
+                            'status' => $asset->status,
+                            'is_active' => $asset->status !== 'tidak_aktif',
+                            'snapshot_at' => $snapshotDate,
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ])
+                    );
+                }
+            });
+    }
 
     private function ensureDateDimension($date): int
     {
@@ -572,7 +809,7 @@ private function syncFactAssetSnapshots(): void
 
         DB::table('dw_dim_dates')->updateOrInsert(
             ['date_key' => $dateKey],
-            [
+            $this->filterColumns('dw_dim_dates', [
                 'full_date' => $carbon->toDateString(),
                 'day' => (int) $carbon->format('d'),
                 'month' => (int) $carbon->format('m'),
@@ -583,10 +820,129 @@ private function syncFactAssetSnapshots(): void
                 'is_weekend' => $carbon->isWeekend(),
                 'created_at' => now(),
                 'updated_at' => now(),
-            ]
+            ])
         );
 
         return $dateKey;
+    }
+
+    private function upsertInventoryMovement(array $uniqueBy, array $values): void
+    {
+        $uniqueBy = $this->filterColumns('dw_fact_inventory_movements', $uniqueBy);
+        $values = $this->filterColumns('dw_fact_inventory_movements', $values);
+
+        if ($uniqueBy === [] || $values === []) {
+            return;
+        }
+
+        DB::table('dw_fact_inventory_movements')->updateOrInsert($uniqueBy, $values);
+    }
+
+    private function inventoryMovementUniqueKey(string $movementNumber, ?int $sourceStockMovementId = null): array
+    {
+        if (Schema::hasColumn('dw_fact_inventory_movements', 'movement_number')) {
+            return ['movement_number' => $movementNumber];
+        }
+
+        if ($sourceStockMovementId !== null && Schema::hasColumn('dw_fact_inventory_movements', 'source_stock_movement_id')) {
+            return ['source_stock_movement_id' => $sourceStockMovementId];
+        }
+
+        return [];
+    }
+
+    private function syntheticSourceStockMovementId(string $type, int $itemId): ?int
+    {
+        if (! Schema::hasColumn('dw_fact_inventory_movements', 'source_stock_movement_id')) {
+            return null;
+        }
+
+        if ($this->isColumnNullable('dw_fact_inventory_movements', 'source_stock_movement_id')) {
+            return null;
+        }
+
+        return $type === 'in'
+            ? 1000000000 + $itemId
+            : 2000000000 + $itemId;
+    }
+
+    private function applyDataWarehouseTransactionStatusFilter($query, string $tableName, string $alias): void
+    {
+        if (! Schema::hasColumn($tableName, 'status')) {
+            return;
+        }
+
+        $excludedStatuses = [
+            'cancelled',
+            'canceled',
+            'rejected',
+            'ditolak',
+            'batal',
+            'void',
+            'failed',
+            'draft',
+        ];
+
+        $query->where(function ($statusQuery) use ($alias, $excludedStatuses): void {
+            $statusQuery
+                ->whereNull($alias . '.status')
+                ->orWhereNotIn(DB::raw('LOWER(' . $alias . '.status)'), $excludedStatuses);
+        });
+    }
+
+    private function dateFromTransaction($transactionDate, $transactionCreatedAt, $itemCreatedAt): Carbon
+    {
+        $value = $transactionDate ?: $transactionCreatedAt ?: $itemCreatedAt ?: now();
+
+        return Carbon::parse($value);
+    }
+
+    private function warehouseExpression(
+        string $itemTable,
+        string $transactionTable,
+        string $itemAlias,
+        string $transactionAlias
+    ): ?string {
+        $hasItemWarehouse = Schema::hasColumn($itemTable, 'warehouse_id');
+        $hasTransactionWarehouse = Schema::hasColumn($transactionTable, 'warehouse_id');
+
+        if ($hasItemWarehouse && $hasTransactionWarehouse) {
+            return 'COALESCE(' . $itemAlias . '.warehouse_id, ' . $transactionAlias . '.warehouse_id)';
+        }
+
+        if ($hasItemWarehouse) {
+            return $itemAlias . '.warehouse_id';
+        }
+
+        if ($hasTransactionWarehouse) {
+            return $transactionAlias . '.warehouse_id';
+        }
+
+        return null;
+    }
+
+    private function filterColumns(string $table, array $data): array
+    {
+        return collect($data)
+            ->filter(fn ($value, string $column): bool => Schema::hasColumn($table, $column))
+            ->all();
+    }
+
+    private function isColumnNullable(string $table, string $column): bool
+    {
+        try {
+            $database = DB::getDatabaseName();
+
+            $result = DB::table('information_schema.COLUMNS')
+                ->where('TABLE_SCHEMA', $database)
+                ->where('TABLE_NAME', $table)
+                ->where('COLUMN_NAME', $column)
+                ->value('IS_NULLABLE');
+
+            return strtoupper((string) $result) === 'YES';
+        } catch (Throwable) {
+            return true;
+        }
     }
 
     private function getAssetCategoryDimId(?int $sourceId): ?int

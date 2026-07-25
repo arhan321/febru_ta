@@ -24,7 +24,14 @@ class Product extends Model
         'last_purchase_price',
         'last_selling_price',
         'description',
+        'logo_path',
         'is_active',
+    ];
+
+    protected $appends = [
+        'display_name',
+        'size_label',
+        'logo_url',
     ];
 
     protected $casts = [
@@ -98,5 +105,14 @@ class Product extends Model
         }
 
         return null;
+    }
+
+    public function getLogoUrlAttribute(): ?string
+    {
+        if (! $this->logo_path) {
+            return null;
+        }
+
+        return asset('storage/' . $this->logo_path);
     }
 }

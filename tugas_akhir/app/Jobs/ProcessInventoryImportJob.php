@@ -2,30 +2,31 @@
 
 namespace App\Jobs;
 
-use App\Models\Customer;
-use App\Models\InboundTransaction;
-use App\Models\InboundTransactionItem;
-use App\Models\InventoryImportLog;
-use App\Models\OutboundTransaction;
-use App\Models\OutboundTransactionItem;
-use App\Models\Product;
-use App\Models\Supplier;
+use Throwable;
 use Carbon\Carbon;
+use App\Models\Product;
+use App\Models\Customer;
+use App\Models\Supplier;
 use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Database\Query\Builder;
-use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\SerializesModels;
+use App\Models\InboundTransaction;
+use App\Models\InventoryImportLog;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema as DBSchema;
+use App\Models\OutboundTransaction;
+use App\Models\InboundTransactionItem;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Queue\SerializesModels;
+use App\Models\OutboundTransactionItem;
 use Illuminate\Support\Facades\Storage;
-use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
+use Illuminate\Support\Facades\Schema as DBSchema;
 use PhpOffice\PhpSpreadsheet\Reader\IReadFilter;
 use PhpOffice\PhpSpreadsheet\Shared\Date as ExcelDate;
-use Throwable;
+
 
 class ProcessInventoryImportJob implements ShouldQueue
 {
@@ -74,7 +75,7 @@ class ProcessInventoryImportJob implements ShouldQueue
                 }
 
                 $result = $transactionType === 'inbound'
-                    ? $this->importInboundGenericExcel($filePath, $log)
+                    ? $this->importInboundFlexibleExcel($filePath, $log)
                     : $this->importOutboundHistoricalExcel($filePath, $this->state, $log);
             }
 
@@ -328,89 +329,997 @@ class ProcessInventoryImportJob implements ShouldQueue
         }
     }
 
-    private function importInboundGenericExcel(string $filePath, ?InventoryImportLog $log = null): array
+    private function listWorksheetInfo(string $filePath): array
     {
-        $warehouseId = $this->selectedWarehouseId();
-        $context = $this->newImportContext();
-        $chunkSize = (int) env('INVENTORY_IMPORT_CHUNK_SIZE', 500);
-        $chunkSize = max(100, min($chunkSize, 1000));
+        $reader = IOFactory::createReaderForFile($filePath);
+        $reader->setReadDataOnly(true);
 
-        $worksheetInfo = IOFactory::createReaderForFile($filePath)->listWorksheetInfo($filePath);
+        if (method_exists($reader, 'listWorksheetInfo')) {
+            return call_user_func([$reader, 'listWorksheetInfo'], $filePath);
+        }
+
+        $spreadsheet = $reader->load($filePath);
+        $info = [];
+
+        foreach ($spreadsheet->getWorksheetIterator() as $worksheet) {
+            $highestColumn = $worksheet->getHighestColumn();
+            $totalColumns = Coordinate::columnIndexFromString($highestColumn);
+
+            $info[] = [
+                'worksheetName' => $worksheet->getTitle(),
+                'totalRows' => $worksheet->getHighestRow(),
+                'totalColumns' => $totalColumns,
+                'lastColumnLetter' => $highestColumn,
+            ];
+        }
+
+        $spreadsheet->disconnectWorksheets();
+        unset($spreadsheet, $reader);
+        gc_collect_cycles();
+
+        return $info;
+    }
+
+    private function worksheetRowsToArrayWithCachedFormulas($sheet, int $highestRow, int $totalColumns): array
+{
+    $rows = [];
+
+    for ($row = 1; $row <= $highestRow; $row++) {
+        $values = [];
+
+        for ($column = 1; $column <= $totalColumns; $column++) {
+            $cellAddress = Coordinate::stringFromColumnIndex($column) . $row;
+            $cell = $sheet->getCell($cellAddress);
+
+            $values[] = $this->spreadsheetCellValue($cell);
+        }
+
+        $rows[] = $values;
+    }
+
+    return $rows;
+}
+
+private function spreadsheetCellValue($cell): mixed
+{
+    $value = null;
+
+    try {
+        $value = $cell->getCalculatedValue();
+    } catch (Throwable) {
+        $value = null;
+    }
+
+    if ($this->isInvalidSpreadsheetValue($value)) {
+        try {
+            $oldCalculatedValue = $cell->getOldCalculatedValue();
+
+            if (! $this->isInvalidSpreadsheetValue($oldCalculatedValue)) {
+                return $oldCalculatedValue;
+            }
+        } catch (Throwable) {
+            // Abaikan, lanjut fallback ke raw value.
+        }
+    }
+
+    if (! $this->isInvalidSpreadsheetValue($value)) {
+        return $value;
+    }
+
+    try {
+        return $cell->getValue();
+    } catch (Throwable) {
+        return null;
+    }
+}
+
+private function isInvalidSpreadsheetValue(mixed $value): bool
+{
+    if ($value === null) {
+        return true;
+    }
+
+    if (is_string($value)) {
+        $value = trim($value);
+
+        return $value === '' || str_starts_with($value, '#');
+    }
+
+    return false;
+}
+
+    private function importInboundFlexibleExcel(string $filePath, ?InventoryImportLog $log = null): array
+    {
+        $worksheetInfo = $this->listWorksheetInfo($filePath);
 
         if (empty($worksheetInfo)) {
             throw new \Exception('File Excel kosong.');
         }
 
+        $warehouseId = $this->selectedWarehouseId();
+        $context = $this->newImportContext();
+
         foreach ($worksheetInfo as $sheetInfo) {
-            $sheetName = $sheetInfo['worksheetName'] ?? null;
+            $sheetName = (string) ($sheetInfo['worksheetName'] ?? '');
+
+            if ($this->shouldSkipFlexibleSheet($sheetName)) {
+                continue;
+            }
+
             $highestRow = (int) ($sheetInfo['totalRows'] ?? 0);
-            $totalColumns = max((int) ($sheetInfo['totalColumns'] ?? 10), 10);
+            $totalColumns = max((int) ($sheetInfo['totalColumns'] ?? 30), 30);
             $highestColumn = Coordinate::stringFromColumnIndex($totalColumns);
-            $headers = null;
 
-            for ($startRow = 1; $startRow <= $highestRow; $startRow += $chunkSize) {
-                $endRow = min($startRow + $chunkSize - 1, $highestRow);
-                $reader = IOFactory::createReaderForFile($filePath);
-                $reader->setReadDataOnly(true);
+            if ($highestRow <= 0) {
+                continue;
+            }
 
-                if ($sheetName) {
-                    $reader->setLoadSheetsOnly([$sheetName]);
-                }
+            $reader = IOFactory::createReaderForFile($filePath);
+            $reader->setReadDataOnly(true);
+            $reader->setLoadSheetsOnly([$sheetName]);
 
-                $reader->setReadFilter(new ExcelChunkReadFilter($startRow, $endRow));
+            $spreadsheet = $reader->load($filePath);
+            $sheet = $spreadsheet->getSheetByName($sheetName);
 
-                $spreadsheet = $reader->load($filePath);
-                $sheet = $sheetName ? $spreadsheet->getSheetByName($sheetName) : $spreadsheet->getActiveSheet();
+            if (! $sheet) {
+                $spreadsheet->disconnectWorksheets();
+                unset($spreadsheet, $reader);
+                continue;
+            }
 
-                if (! $sheet) {
-                    $spreadsheet->disconnectWorksheets();
-                    unset($spreadsheet, $reader);
-                    continue;
-                }
+            $rows = $this->worksheetRowsToArrayWithCachedFormulas($sheet, $highestRow, $totalColumns);
 
-                $rows = $sheet->rangeToArray("A{$startRow}:{$highestColumn}{$endRow}", null, true, false);
+            $headerInfo = $this->findFlexibleInboundHeader($rows);
 
-                foreach ($rows as $row) {
-                    $values = collect($row)->map(fn ($value) => is_string($value) ? trim($value) : $value)->values();
-
-                    if ($this->isEmptyExcelRow($values)) {
-                        continue;
-                    }
-
-                    if ($headers === null) {
-                        $headers = $values
-                            ->map(fn ($value) => $this->normalizeKey((string) $value))
-                            ->values()
-                            ->all();
-
-                        continue;
-                    }
-
-                    $record = [];
-
-                    foreach ($headers as $index => $header) {
-                        if ($header !== '') {
-                            $record[$header] = $values->get($index);
-                        }
-                    }
-
-                    $this->processGenericRow('inbound', $this->normalizeRecord($record), $warehouseId, $context);
-                }
-
-                $this->updateProgressLog($log, $context);
+            if (! $headerInfo) {
+                $this->skipRow($context, "Sheet {$sheetName} dilewati: header tidak ditemukan.");
 
                 $spreadsheet->disconnectWorksheets();
                 unset($rows, $sheet, $spreadsheet, $reader);
                 gc_collect_cycles();
+
+                continue;
             }
+
+            $supplierName = $this->detectFlexibleSupplierName($rows, $sheetName, $filePath);
+
+            $currentDate = null;
+            $currentInvoice = null;
+            $currentSupplierName = $supplierName;
+
+            for ($index = $headerInfo['row_index'] + 1; $index < count($rows); $index++) {
+                $rowNumber = $index + 1;
+
+                $values = collect($rows[$index])
+                    ->map(fn ($value) => is_string($value) ? trim($value) : $value)
+                    ->values();
+
+                if ($this->isEmptyExcelRow($values)) {
+                    continue;
+                }
+
+                $context['total_rows']++;
+
+                if ($this->isFlexibleSummaryRow($values, $headerInfo)) {
+                    continue;
+                }
+
+                $record = $this->makeFlexibleInboundRecord(
+                    values: $values,
+                    headerInfo: $headerInfo,
+                    defaultSupplierName: $supplierName,
+                    sheetName: $sheetName,
+                    rowNumber: $rowNumber,
+                    currentDate: $currentDate,
+                    currentInvoice: $currentInvoice,
+                    currentSupplierName: $currentSupplierName,
+                    context: $context
+                );
+
+                if (! $record) {
+                    continue;
+                }
+
+                $this->processGenericRow(
+                    transactionType: 'inbound',
+                    record: $this->normalizeRecord($record),
+                    warehouseId: $warehouseId,
+                    context: $context,
+                    countRow: false
+                );
+            }
+
+            $this->updateProgressLog($log, $context);
+
+            $spreadsheet->disconnectWorksheets();
+            unset($rows, $sheet, $spreadsheet, $reader);
+            gc_collect_cycles();
         }
 
         return $this->finishContext($context, 'Import barang masuk dari Excel selesai.');
     }
 
+    private function shouldSkipFlexibleSheet(string $sheetName): bool
+    {
+        $name = strtoupper(trim($sheetName));
+
+        return in_array($name, [
+            'TARIF',
+            'T.BARU',
+            'H.BELI',
+            'HARGA',
+            'PRICE',
+            'SETTING',
+            'CONFIG',
+            'MASTER',
+        ], true);
+    }
+
+    private function findFlexibleInboundHeader(array $rows): ?array
+    {
+        $bestHeader = null;
+        $bestScore = 0;
+
+        foreach ($rows as $rowIndex => $row) {
+            $values = collect($row)
+                ->map(fn ($value) => $this->normalizeExcelHeader((string) $value))
+                ->values();
+
+            $mapping = $this->mapFlexibleInboundColumns($values);
+
+            $score = 0;
+
+            foreach (['tanggal', 'no_invoice', 'kode_barang', 'nama_barang', 'qty', 'harga', 'subtotal'] as $key) {
+                if (array_key_exists($key, $mapping)) {
+                    $score++;
+                }
+            }
+
+            $hasDate = array_key_exists('tanggal', $mapping);
+            $hasInvoice = array_key_exists('no_invoice', $mapping);
+            $hasQty = array_key_exists('qty', $mapping);
+            $hasProductSource = array_key_exists('nama_barang', $mapping) || array_key_exists('kode_barang', $mapping);
+            $hasAmountSource = array_key_exists('harga', $mapping) || array_key_exists('subtotal', $mapping);
+
+            if ($hasDate && $hasInvoice && $hasQty && $hasProductSource && $hasAmountSource && $score > $bestScore) {
+                $bestScore = $score;
+                $bestHeader = [
+                    'row_index' => $rowIndex,
+                    'mapping' => $mapping,
+                    'header_values' => $values->all(),
+                ];
+            }
+        }
+
+        return $bestHeader;
+    }
+
+    private function mapFlexibleInboundColumns(Collection $headers): array
+    {
+        $aliases = $this->flexibleInboundColumnAliases();
+        $mapping = [];
+
+        foreach ($headers as $index => $header) {
+            if ($header === '') {
+                continue;
+            }
+
+            foreach ($aliases as $standardKey => $aliasList) {
+                foreach ($aliasList as $alias) {
+                    $normalizedAlias = $this->normalizeExcelHeader($alias);
+
+                    if ($header === $normalizedAlias) {
+                        $mapping[$standardKey] = (int) $index;
+                        continue 3;
+                    }
+                }
+            }
+        }
+
+        return $mapping;
+    }
+
+    private function flexibleInboundColumnAliases(): array
+    {
+        return [
+            'tanggal' => [
+                'tanggal',
+                'tgl',
+                'date',
+                'transaction_date',
+                'tgl_transaksi',
+            ],
+
+            'no_invoice' => [
+                'no_invoice',
+                'invoice',
+                'invoice_number',
+                'nomor_invoice',
+                'reference_number',
+                'no_sj',
+                'sj',
+                's_jalan',
+                's. jalan',
+                'surat_jalan',
+                'no_surat_jalan',
+                'no_po',
+                'po',
+            ],
+
+            'nama_supplier' => [
+                'supplier',
+                'nama_supplier',
+                'vendor',
+                'vendor_name',
+                'pemasok',
+                'nama_pemasok',
+            ],
+
+            'kode_barang' => [
+                'kode',
+                'kode_barang',
+                'code',
+                'product_code',
+                'sku',
+                'item_code',
+                'kode_produk',
+            ],
+
+            'nama_barang' => [
+                'nama_barang',
+                'barang',
+                'produk',
+                'product',
+                'product_name',
+                'item_name',
+                'nama_produk',
+                'description',
+                'deskripsi',
+            ],
+
+            'ukuran' => [
+                'ukuran',
+                'size',
+                'dimensi',
+                'dimension',
+                'panjang',
+                'lebar',
+                'tinggi',
+            ],
+
+            'qty' => [
+                'qty',
+                'quantity',
+                'jumlah_barang',
+                'pcs',
+            ],
+
+            'm3' => [
+                'm3',
+                'm³',
+                'kubikasi',
+                'volume',
+            ],
+
+            'harga' => [
+                'harga',
+                'harga_satuan',
+                'harga_beli',
+                'unit_cost',
+                'unit_price',
+                'price',
+                'cost',
+                'rate',
+            ],
+
+            'subtotal' => [
+                'jumlah',
+                'subtotal',
+                'sub_total',
+                'total',
+                'amount',
+                'nilai',
+                'total_harga',
+                'jumlah_rp',
+            ],
+
+            'keterangan' => [
+                'keterangan',
+                'note',
+                'notes',
+                'remark',
+                'remarks',
+            ],
+        ];
+    }
+
+    private function normalizeExcelHeader(string $value): string
+    {
+        $value = strtolower(trim($value));
+        $value = str_replace(['.', '/', '\\', '-', ' '], '_', $value);
+        $value = preg_replace('/[^a-z0-9_]/', '', $value);
+        $value = preg_replace('/_+/', '_', (string) $value);
+
+        return trim((string) $value, '_');
+    }
+
+    private function makeFlexibleInboundRecord(
+    Collection $values,
+    array $headerInfo,
+    string $defaultSupplierName,
+    string $sheetName,
+    int $rowNumber,
+    ?Carbon &$currentDate,
+    ?string &$currentInvoice,
+    ?string &$currentSupplierName,
+    array &$context
+): ?array {
+    $mapping = $headerInfo['mapping'];
+
+    $date = $this->mappedDateValue($values, $mapping, 'tanggal');
+
+    if ($date) {
+        $currentDate = $date;
+    }
+
+    $supplierName = $this->mappedStringValue($values, $mapping, 'nama_supplier');
+
+    if ($supplierName) {
+        $currentSupplierName = $supplierName;
+    }
+
+    if (! $currentSupplierName) {
+        $currentSupplierName = $defaultSupplierName;
+    }
+
+    $invoice = $this->buildFlexibleInvoiceNumber($values, $mapping, $currentSupplierName);
+
+    if ($invoice) {
+        $currentInvoice = $invoice;
+    }
+
+    if (! $currentDate) {
+        $this->skipRow($context, "Baris {$rowNumber} sheet {$sheetName} dilewati: tanggal tidak valid.");
+        return null;
+    }
+
+    if (! $currentInvoice) {
+        $this->skipRow($context, "Baris {$rowNumber} sheet {$sheetName} dilewati: nomor invoice/surat jalan tidak ditemukan.");
+        return null;
+    }
+
+    $productName = $this->buildFlexibleInboundProductName($values, $mapping);
+
+    if (! $productName) {
+        $this->skipRow($context, "Baris {$rowNumber} sheet {$sheetName} dilewati: nama/kode barang kosong.");
+        return null;
+    }
+
+    if ($this->isNonStockProductLine($productName)) {
+        return null;
+    }
+
+    $qtyRaw = $this->mappedRawValue($values, $mapping, 'qty');
+    $m3Raw = $this->mappedRawValue($values, $mapping, 'm3');
+
+    $moneyValues = $this->inferFlexibleInboundMoneyValues($values, $mapping);
+
+    $qtyNumber = $this->toNumber($qtyRaw);
+    $volumeM3 = $this->toNumber($m3Raw);
+    $pricePerM3 = $this->toNumber($moneyValues['harga'] ?? null);
+    $excelSubtotal = $this->toNumber($moneyValues['subtotal'] ?? null);
+
+    if ($qtyNumber <= 0) {
+        $this->skipRow($context, "Baris {$rowNumber} sheet {$sheetName} dilewati: qty kosong/tidak valid.");
+        return null;
+    }
+
+    /*
+     * Kalau kolom JUMLAH Excel kosong, fallback:
+     * M3 x HARGA/M3.
+     */
+    if ($excelSubtotal <= 0 && $volumeM3 > 0 && $pricePerM3 > 0) {
+        $excelSubtotal = $volumeM3 * $pricePerM3;
+    }
+
+    /*
+     * Fallback terakhir untuk format umum:
+     * QTY x HARGA.
+     */
+    if ($excelSubtotal <= 0 && $qtyNumber > 0 && $pricePerM3 > 0) {
+        $excelSubtotal = $qtyNumber * $pricePerM3;
+    }
+
+    $scaledMoney = $this->normalizeInboundMoneyScale(
+        harga: $pricePerM3,
+        subtotal: $excelSubtotal,
+        supplierName: $currentSupplierName ?: $defaultSupplierName
+    );
+
+    $pricePerM3 = $scaledMoney['harga'];
+    $excelSubtotal = $scaledMoney['subtotal'];
+
+    /*
+     * Harga sistem inventory:
+     * unit_cost = JUMLAH Excel / QTY
+     */
+    $unitCost = $excelSubtotal > 0 && $qtyNumber > 0
+        ? round($excelSubtotal / $qtyNumber, 2)
+        : 0;
+
+    $keterangan = $this->mappedStringValue($values, $mapping, 'keterangan');
+
+    $noteParts = [];
+
+    if ($keterangan) {
+        $noteParts[] = $keterangan;
+    }
+
+    $noteParts[] = 'Import barang masuk dari sheet ' . $sheetName . ', baris ' . $rowNumber;
+
+    if ($volumeM3 > 0) {
+        $noteParts[] = 'M3 Excel: ' . $this->formatImportedNumberForNote($volumeM3);
+    }
+
+    if ($pricePerM3 > 0) {
+        $noteParts[] = 'Harga/M3 Excel: ' . $this->formatImportedNumberForNote($pricePerM3);
+    }
+
+    if ($excelSubtotal > 0) {
+        $noteParts[] = 'Jumlah Excel: ' . $this->formatImportedNumberForNote($excelSubtotal);
+    }
+
+    /*
+     * Debug sementara.
+     * Kalau Harga/M3 atau Jumlah Excel masih kosong,
+     * nanti Catatan Item akan menampilkan isi kolom setelah M3.
+     */
+    if (($pricePerM3 <= 0 || $excelSubtotal <= 0) && ! empty($moneyValues['debug'])) {
+        $noteParts[] = 'DEBUG setelah M3: ' . $moneyValues['debug'];
+    }
+
+    return [
+        'tanggal' => $currentDate->toDateString(),
+        'no_invoice' => $currentInvoice,
+        'nama_supplier' => $currentSupplierName ?: $defaultSupplierName,
+        'nama_barang' => $productName,
+
+        // Data utama sistem inventory
+        'qty' => $qtyNumber,
+        'harga' => $unitCost,
+        'subtotal' => $excelSubtotal,
+
+        // Data asli Excel QNT/VITA
+        'volume_m3' => $volumeM3 > 0 ? $volumeM3 : null,
+        'price_per_m3' => $pricePerM3 > 0 ? $pricePerM3 : null,
+        'excel_subtotal' => $excelSubtotal > 0 ? $excelSubtotal : null,
+
+        'status' => $this->statusAfterImport(),
+        'keterangan' => implode(' | ', $noteParts),
+    ];
+}
+
+    private function normalizeInboundMoneyScale(float $harga, float $subtotal, string $supplierName): array
+    {
+        $multiplier = $this->inboundMoneyMultiplier($harga, $subtotal, $supplierName);
+
+        return [
+            'harga' => round($harga * $multiplier, 2),
+            'subtotal' => round($subtotal * $multiplier, 2),
+        ];
+    }
+
+    private function inboundMoneyMultiplier(float $harga, float $subtotal, string $supplierName): float
+{
+    $manualMultiplier = $this->state['money_multiplier']
+        ?? $this->state['nominal_multiplier']
+        ?? $this->state['price_multiplier']
+        ?? null;
+
+    if (is_numeric($manualMultiplier) && (float) $manualMultiplier > 0) {
+        return (float) $manualMultiplier;
+    }
+
+    return 1;
+}
+
+    private function formatImportedNumberForNote(float $value): string
+    {
+        return rtrim(rtrim(number_format($value, 4, '.', ''), '0'), '.');
+    }
+
+    private function inferFlexibleInboundMoneyValues(Collection $values, array $mapping): array
+{
+    $qtyIndex = array_key_exists('qty', $mapping) ? (int) $mapping['qty'] : null;
+    $m3Index = array_key_exists('m3', $mapping) ? (int) $mapping['m3'] : null;
+
+    /*
+     * PRIORITAS QNT/VITA:
+     *
+     * Format Excel:
+     * QTY | M3 | Rp | HARGA | Rp | JUMLAH
+     *
+     * Kalau kolom M3 ditemukan:
+     * - angka valid pertama setelah M3 = HARGA/M3
+     * - angka valid kedua setelah M3   = JUMLAH Excel
+     */
+    if ($m3Index !== null) {
+        $numericCandidates = $this->numericCandidatesFromRow(
+            values: $values,
+            startIndex: $m3Index + 1,
+            maxLookAhead: 20
+        );
+
+        return [
+            'harga' => $numericCandidates[0]['raw'] ?? null,
+            'subtotal' => $numericCandidates[1]['raw'] ?? null,
+            'debug' => $this->debugRowSlice($values, $m3Index + 1, 20),
+        ];
+    }
+
+    /*
+     * Fallback format umum:
+     * QTY | HARGA | SUBTOTAL
+     */
+    $harga = $this->mappedRawValue($values, $mapping, 'harga');
+    $subtotal = $this->mappedRawValue($values, $mapping, 'subtotal');
+
+    $hargaNumber = $this->toNumber($harga);
+    $subtotalNumber = $this->toNumber($subtotal);
+
+    if ($hargaNumber > 0 && $subtotalNumber > 0) {
+        return [
+            'harga' => $harga,
+            'subtotal' => $subtotal,
+            'debug' => '',
+        ];
+    }
+
+    if ($qtyIndex !== null) {
+        $numericCandidates = $this->numericCandidatesFromRow(
+            values: $values,
+            startIndex: $qtyIndex + 1,
+            maxLookAhead: 20
+        );
+
+        if ($hargaNumber <= 0 && count($numericCandidates) >= 1) {
+            $harga = $numericCandidates[0]['raw'];
+        }
+
+        if ($subtotalNumber <= 0 && count($numericCandidates) >= 2) {
+            $subtotal = $numericCandidates[1]['raw'];
+        }
+
+        return [
+            'harga' => $harga,
+            'subtotal' => $subtotal,
+            'debug' => $this->debugRowSlice($values, $qtyIndex + 1, 20),
+        ];
+    }
+
+    return [
+        'harga' => $harga,
+        'subtotal' => $subtotal,
+        'debug' => '',
+    ];
+}
+
+private function numericCandidatesFromRow(Collection $values, int $startIndex, int $maxLookAhead = 20): array
+{
+    $numericCandidates = [];
+    $endIndex = min($values->count() - 1, $startIndex + $maxLookAhead);
+
+    for ($index = $startIndex; $index <= $endIndex; $index++) {
+        $candidate = $values->get($index);
+
+        if ($candidate === null || trim((string) $candidate) === '') {
+            continue;
+        }
+
+        $number = $this->toNumber($candidate);
+
+        if ($number <= 0) {
+            continue;
+        }
+
+        $numericCandidates[] = [
+            'raw' => $candidate,
+            'number' => $number,
+            'index' => $index,
+        ];
+
+        if (count($numericCandidates) >= 2) {
+            break;
+        }
+    }
+
+    return $numericCandidates;
+}
+
+private function debugRowSlice(Collection $values, int $startIndex, int $maxLookAhead = 20): string
+{
+    $parts = [];
+    $endIndex = min($values->count() - 1, $startIndex + $maxLookAhead);
+
+    for ($index = $startIndex; $index <= $endIndex; $index++) {
+        $value = $values->get($index);
+
+        if ($value === null || trim((string) $value) === '') {
+            continue;
+        }
+
+        if ($value instanceof \DateTimeInterface) {
+            $text = $value->format('Y-m-d H:i:s');
+        } else {
+            $text = trim((string) $value);
+        }
+
+        if ($text === '') {
+            continue;
+        }
+
+        $parts[] = $index . '=' . $text;
+    }
+
+    return implode(' | ', $parts);
+}
+
+    private function mappedRawValue(Collection $values, array $mapping, string $key): mixed
+    {
+        if (! array_key_exists($key, $mapping)) {
+            return null;
+        }
+
+        return $values->get((int) $mapping[$key]);
+    }
+
+    private function mappedStringValue(Collection $values, array $mapping, string $key): ?string
+    {
+        $value = $this->mappedRawValue($values, $mapping, $key);
+
+        if ($value === null) {
+            return null;
+        }
+
+        $value = trim((string) $value);
+
+        return $value === '' ? null : $value;
+    }
+
+    private function mappedDateValue(Collection $values, array $mapping, string $key): ?Carbon
+    {
+        return $this->toDate($this->mappedRawValue($values, $mapping, $key));
+    }
+
+    private function buildFlexibleInvoiceNumber(Collection $values, array $mapping, string $supplierName): ?string
+    {
+        if (! array_key_exists('no_invoice', $mapping)) {
+            return null;
+        }
+
+        $invoiceIndex = (int) $mapping['no_invoice'];
+        $invoiceParts = [];
+
+        $endIndex = $invoiceIndex;
+
+        if (array_key_exists('kode_barang', $mapping)) {
+            $endIndex = max($invoiceIndex, ((int) $mapping['kode_barang']) - 1);
+        }
+
+        for ($index = $invoiceIndex; $index <= $endIndex; $index++) {
+            $value = $values->get($index);
+
+            if ($value === null || trim((string) $value) === '') {
+                continue;
+            }
+
+            $text = trim((string) $value);
+
+            if (is_numeric($value) && (float) $value === floor((float) $value)) {
+                $text = (string) ((int) $value);
+            }
+
+            $invoiceParts[] = $text;
+        }
+
+        if (empty($invoiceParts)) {
+            return null;
+        }
+
+        $rawInvoice = implode('-', $invoiceParts);
+        $rawInvoice = preg_replace('/-+/', '-', $rawInvoice);
+        $rawInvoice = trim((string) $rawInvoice, '-');
+
+        if ($rawInvoice === '') {
+            return null;
+        }
+
+        return $this->supplierInvoicePrefix($supplierName) . '-' . $rawInvoice;
+    }
+
+    private function buildFlexibleInboundProductName(Collection $values, array $mapping): ?string
+    {
+        $name = $this->mappedStringValue($values, $mapping, 'nama_barang');
+
+        if ($name) {
+            return $this->cleanImportedProductName($name);
+        }
+
+        $kode = $this->mappedStringValue($values, $mapping, 'kode_barang');
+
+        if (! $kode) {
+            return null;
+        }
+
+        $kode = $this->cleanImportedProductName($kode);
+
+        $dimensionParts = [];
+
+        if (array_key_exists('ukuran', $mapping)) {
+            $start = (int) $mapping['ukuran'];
+            $end = array_key_exists('qty', $mapping)
+                ? ((int) $mapping['qty']) - 1
+                : $start;
+
+            for ($index = $start; $index <= $end; $index++) {
+                $value = $values->get($index);
+
+                if ($value === null || trim((string) $value) === '') {
+                    continue;
+                }
+
+                $dimensionParts[] = $this->cleanFlexibleDimensionPart($value);
+            }
+        } elseif (array_key_exists('kode_barang', $mapping) && array_key_exists('qty', $mapping)) {
+            $start = ((int) $mapping['kode_barang']) + 1;
+            $end = ((int) $mapping['qty']) - 1;
+
+            for ($index = $start; $index <= $end; $index++) {
+                $value = $values->get($index);
+
+                if ($value === null || trim((string) $value) === '') {
+                    continue;
+                }
+
+                $dimensionParts[] = $this->cleanFlexibleDimensionPart($value);
+            }
+        }
+
+        $dimensionParts = array_values(array_filter($dimensionParts));
+
+        if (empty($dimensionParts)) {
+            return $kode;
+        }
+
+        return trim($kode . ' ' . implode('X', $dimensionParts));
+    }
+
+    private function cleanFlexibleDimensionPart(mixed $value): string
+    {
+        if (is_numeric($value)) {
+            $number = (float) $value;
+
+            return floor($number) == $number
+                ? (string) ((int) $number)
+                : rtrim(rtrim((string) $number, '0'), '.');
+        }
+
+        $text = strtoupper(trim((string) $value));
+
+        if (in_array($text, ['X', '×', '*'], true)) {
+            return '';
+        }
+
+        return $text;
+    }
+
+    private function isFlexibleSummaryRow(Collection $values, array $headerInfo): bool
+    {
+        $mapping = $headerInfo['mapping'];
+
+        $texts = $values
+            ->map(fn ($value) => strtoupper(trim((string) $value)))
+            ->filter()
+            ->values();
+
+        if ($texts->isEmpty()) {
+            return true;
+        }
+
+        $joined = $texts->implode(' ');
+
+        if (
+            str_contains($joined, 'TOTAL') ||
+            str_contains($joined, 'GRAND TOTAL') ||
+            str_contains($joined, 'JUMLAH TOTAL')
+        ) {
+            return true;
+        }
+
+        $productText = null;
+
+        if (array_key_exists('nama_barang', $mapping)) {
+            $productText = strtoupper((string) $values->get((int) $mapping['nama_barang']));
+        } elseif (array_key_exists('kode_barang', $mapping)) {
+            $productText = strtoupper((string) $values->get((int) $mapping['kode_barang']));
+        }
+
+        return in_array(trim((string) $productText), [
+            '',
+            'KODE',
+            'NAMA BARANG',
+            'NAMA PRODUK',
+            'TOTAL',
+            'JUMLAH',
+        ], true);
+    }
+
+    private function detectFlexibleSupplierName(array $rows, string $sheetName, string $filePath): string
+    {
+        foreach (array_slice($rows, 0, 10) as $row) {
+            foreach ($row as $value) {
+                $text = trim((string) $value);
+
+                if ($text === '') {
+                    continue;
+                }
+
+                $upper = strtoupper($text);
+
+                if (str_starts_with($upper, 'PT ')) {
+                    return $text;
+                }
+
+                if (str_starts_with($upper, 'PT.')) {
+                    return $text;
+                }
+
+                if (str_contains($upper, 'QUANTUM')) {
+                    return 'PT. QUANTUM TOSAN INTERNASIONAL';
+                }
+
+                if (str_contains($upper, 'TRI SUKSES')) {
+                    return 'PT. TRI SUKSES JAYA';
+                }
+
+                if (str_contains($upper, 'VITA')) {
+                    return 'PT. TRI SUKSES JAYA';
+                }
+            }
+        }
+
+        $filename = strtoupper(pathinfo($filePath, \PATHINFO_FILENAME));
+        $upperSheet = strtoupper($sheetName);
+
+        if (str_contains($filename, 'QNT') || str_contains($upperSheet, 'QNT')) {
+            return 'PT. QUANTUM TOSAN INTERNASIONAL';
+        }
+
+        if (str_contains($filename, 'VITA') || str_contains($upperSheet, 'VITA')) {
+            return 'PT. TRI SUKSES JAYA';
+        }
+
+        return 'Supplier Import Excel';
+    }
+
+    private function supplierInvoicePrefix(string $supplierName): string
+    {
+        $upper = strtoupper($supplierName);
+
+        if (str_contains($upper, 'QUANTUM')) {
+            return 'QNT';
+        }
+
+        if (str_contains($upper, 'TRI SUKSES') || str_contains($upper, 'VITA')) {
+            return 'VITA';
+        }
+
+        return 'SUP';
+    }
+
     private function importOutboundHistoricalExcel(string $filePath, array $state, ?InventoryImportLog $log = null): array
     {
-        $worksheetInfo = IOFactory::createReaderForFile($filePath)->listWorksheetInfo($filePath);
+        $worksheetInfo = $this->listWorksheetInfo($filePath);
 
         if (empty($worksheetInfo)) {
             throw new \Exception('File Excel kosong.');
@@ -418,10 +1327,6 @@ class ProcessInventoryImportJob implements ShouldQueue
 
         $warehouseId = $this->selectedWarehouseId();
         $context = $this->newImportContext();
-
-        $currentDate = null;
-        $currentInvoice = null;
-        $currentCustomerName = null;
 
         $chunkSize = (int) env('INVENTORY_IMPORT_CHUNK_SIZE', 500);
         $chunkSize = max(100, min($chunkSize, 1000));
@@ -431,6 +1336,10 @@ class ProcessInventoryImportJob implements ShouldQueue
             $highestRow = (int) ($sheetInfo['totalRows'] ?? 0);
             $totalColumns = max((int) ($sheetInfo['totalColumns'] ?? 42), 42);
             $highestColumn = Coordinate::stringFromColumnIndex($totalColumns);
+
+            $currentDate = null;
+            $currentInvoice = null;
+            $currentCustomerName = null;
 
             if ($highestRow <= 0) {
                 continue;
@@ -446,7 +1355,7 @@ class ProcessInventoryImportJob implements ShouldQueue
                     $reader->setLoadSheetsOnly([$sheetName]);
                 }
 
-                $reader->setReadFilter(new ExcelChunkReadFilter($startRow, $endRow));
+                $reader->setReadFilter(new \App\Jobs\ExcelChunkReadFilter($startRow, $endRow));
 
                 $spreadsheet = $reader->load($filePath);
                 $sheet = $sheetName ? $spreadsheet->getSheetByName($sheetName) : $spreadsheet->getActiveSheet();
@@ -547,6 +1456,10 @@ class ProcessInventoryImportJob implements ShouldQueue
         $subtotal = $this->toNumber($this->recordValue($record, ['subtotal', 'sub_total', 'total', 'amount']));
         $note = $this->stringValue($this->recordValue($record, ['keterangan', 'note', 'notes', 'remark', 'remarks']));
 
+        $volumeM3 = $this->toNumber($this->recordValue($record, ['volume_m3']));
+        $pricePerM3 = $this->toNumber($this->recordValue($record, ['price_per_m3']));
+        $excelSubtotal = $this->toNumber($this->recordValue($record, ['excel_subtotal']));
+
         if (! $date) {
             $this->skipRow($context, 'Baris dilewati: tanggal transaksi tidak valid.');
             return;
@@ -562,6 +1475,11 @@ class ProcessInventoryImportJob implements ShouldQueue
             return;
         }
 
+        if ($this->isNonStockProductLine($productName)) {
+            $this->skipRow($context, "Invoice {$invoice} dilewati: '{$productName}' dianggap bukan barang stok.");
+            return;
+        }
+
         if ($qty <= 0) {
             $this->skipRow($context, "Baris invoice {$invoice} dilewati: qty kosong/tidak valid.");
             return;
@@ -574,22 +1492,63 @@ class ProcessInventoryImportJob implements ShouldQueue
         $product = $this->findProductByExcelName($productName);
 
         if (! $product) {
-            $this->skipRow($context, "Invoice {$invoice} dilewati: produk '{$productName}' tidak ditemukan di master produk.");
+            $this->skipRow($context, "Invoice {$invoice} dilewati: produk '{$productName}' gagal dibuat otomatis.");
             return;
         }
 
         if ($transactionType === 'inbound') {
             $supplierName = $this->stringValue($this->recordValue($record, ['nama_supplier', 'supplier_name', 'supplier', 'vendor', 'vendor_name']));
-            $this->storeInboundRow($date, $invoice, $supplierName, $product, $qty, $unitPrice, $subtotal, $warehouseId, $note, $context);
+
+            $this->storeInboundRow(
+                date: $date,
+                invoice: $invoice,
+                supplierName: $supplierName,
+                product: $product,
+                qty: $qty,
+                unitPrice: $unitPrice,
+                subtotal: $subtotal,
+                warehouseId: $warehouseId,
+                note: $note,
+                context: $context,
+                volumeM3: $volumeM3 > 0 ? $volumeM3 : null,
+                pricePerM3: $pricePerM3 > 0 ? $pricePerM3 : null,
+                excelSubtotal: $excelSubtotal > 0 ? $excelSubtotal : null,
+            );
         } else {
             $customerName = $this->stringValue($this->recordValue($record, ['nama_customer', 'customer_name', 'customer', 'pelanggan', 'tujuan']));
             $salesName = $this->stringValue($this->recordValue($record, ['sales_name', 'sales', 'admin'])) ?: 'Admin';
-            $this->storeOutboundRow($date, $invoice, $customerName, $salesName, $product, $qty, $unitPrice, $subtotal, $warehouseId, $note, $context);
+
+            $this->storeOutboundRow(
+                date: $date,
+                invoice: $invoice,
+                customerName: $customerName,
+                salesName: $salesName,
+                product: $product,
+                qty: $qty,
+                unitPrice: $unitPrice,
+                subtotal: $subtotal,
+                warehouseId: $warehouseId,
+                note: $note,
+                context: $context
+            );
         }
     }
 
-    private function storeInboundRow(Carbon $date, string $invoice, ?string $supplierName, Product $product, float $qty, float $unitPrice, float $subtotal, int $warehouseId, ?string $note, array &$context): void
-    {
+    private function storeInboundRow(
+        Carbon $date,
+        string $invoice,
+        ?string $supplierName,
+        Product $product,
+        float $qty,
+        float $unitPrice,
+        float $subtotal,
+        int $warehouseId,
+        ?string $note,
+        array &$context,
+        ?float $volumeM3 = null,
+        ?float $pricePerM3 = null,
+        ?float $excelSubtotal = null,
+    ): void {
         $source = $this->sourceName();
         $duplicateKey = 'inbound:' . $source . ':' . $invoice;
 
@@ -643,7 +1602,7 @@ class ProcessInventoryImportJob implements ShouldQueue
 
         $transactionId = $context['transaction_id_cache'][$transactionCacheKey];
 
-        InboundTransactionItem::create($this->filterColumns('inbound_transaction_items', [
+        $item = InboundTransactionItem::create($this->filterColumns('inbound_transaction_items', [
             'inbound_transaction_id' => $transactionId,
             'product_id' => $product->id,
             'warehouse_id' => $warehouseId,
@@ -656,6 +1615,9 @@ class ProcessInventoryImportJob implements ShouldQueue
             'discount_amount' => 0,
             'subtotal' => $subtotal,
             'sub_total' => $subtotal,
+            'volume_m3' => $volumeM3,
+            'price_per_m3' => $pricePerM3,
+            'excel_subtotal' => $excelSubtotal,
             'stock_before_submit' => 0,
             'stock_after_submit' => 0,
             'product_code_snapshot' => $this->getProductValue($product, ['product_code', 'code', 'sku']),
@@ -667,7 +1629,7 @@ class ProcessInventoryImportJob implements ShouldQueue
         $this->incrementTransactionTotals('inbound_transactions', $transactionId, $subtotal);
 
         if ($this->shouldUpdateOperationalStock()) {
-            $this->applyStockMovement(
+            $stockResult = $this->applyStockMovement(
                 productId: (int) $product->id,
                 warehouseId: $warehouseId,
                 qty: $qty,
@@ -677,13 +1639,32 @@ class ProcessInventoryImportJob implements ShouldQueue
                 description: 'Import barang masuk. Invoice: ' . $invoice,
                 movementDate: $date,
             );
+
+            DB::table('inbound_transaction_items')
+                ->where('id', $item->id)
+                ->update($this->filterColumns('inbound_transaction_items', [
+                    'stock_before_submit' => $stockResult['stock_before'],
+                    'stock_after_submit' => $stockResult['stock_after'],
+                    'updated_at' => now(),
+                ]));
         }
 
         $context['imported_rows']++;
     }
 
-    private function storeOutboundRow(Carbon $date, string $invoice, ?string $customerName, string $salesName, Product $product, float $qty, float $unitPrice, float $subtotal, int $warehouseId, ?string $note, array &$context): void
-    {
+    private function storeOutboundRow(
+        Carbon $date,
+        string $invoice,
+        ?string $customerName,
+        string $salesName,
+        Product $product,
+        float $qty,
+        float $unitPrice,
+        float $subtotal,
+        int $warehouseId,
+        ?string $note,
+        array &$context
+    ): void {
         $source = $this->sourceName();
         $duplicateKey = 'outbound:' . $source . ':' . $invoice;
 
@@ -814,7 +1795,7 @@ class ProcessInventoryImportJob implements ShouldQueue
             'completed',
         ], true);
 
-        return $isApproved && filter_var($updateStock, FILTER_VALIDATE_BOOL);
+        return $isApproved && filter_var($updateStock, \FILTER_VALIDATE_BOOL);
     }
 
     private function applyStockMovement(
@@ -923,7 +1904,7 @@ class ProcessInventoryImportJob implements ShouldQueue
             $nextSequence = ((int) substr((string) $lastNumber, -6)) + 1;
         }
 
-        return "{$prefix}-{$dateText}-" . str_pad((string) $nextSequence, 6, '0', STR_PAD_LEFT);
+        return "{$prefix}-{$dateText}-" . str_pad((string) $nextSequence, 6, '0', \STR_PAD_LEFT);
     }
 
     private function filterColumns(string $table, array $data): array
@@ -950,7 +1931,7 @@ class ProcessInventoryImportJob implements ShouldQueue
     {
         $context['skipped_rows']++;
 
-        if (count($context['skipped_messages']) < 50) {
+        if (count($context['skipped_messages']) < 80) {
             $context['skipped_messages'][] = $message;
         }
     }
@@ -1070,25 +2051,88 @@ class ProcessInventoryImportJob implements ShouldQueue
     }
 
     private function toDate(mixed $value): ?Carbon
-    {
+{
+    try {
+        if ($value instanceof \DateTimeInterface) {
+            return $this->normalizeImportedDateYear(Carbon::instance($value));
+        }
+
+        if (is_numeric($value)) {
+            return $this->normalizeImportedDateYear(
+                Carbon::instance(ExcelDate::excelToDateTimeObject((float) $value))
+            );
+        }
+
+        if (is_string($value) && trim($value) !== '') {
+            $value = trim($value);
+
+            $formats = [
+                'd/m/Y',
+                'd-m-Y',
+                'd.m.Y',
+                'Y-m-d',
+                'Y/m/d',
+                'm/d/Y',
+
+                // Tambahan untuk format tahun 2 digit dari Excel
+                'd/m/y',
+                'd-m-y',
+                'd.m.y',
+                'd-M-y',
+                'd M y',
+                'd-M-Y',
+                'd M Y',
+            ];
+
+            foreach ($formats as $format) {
+                try {
+                    $date = Carbon::createFromFormat($format, $value);
+
+                    if ($date instanceof Carbon) {
+                        return $this->normalizeImportedDateYear($date);
+                    }
+                } catch (Throwable) {
+                    continue;
+                }
+            }
+
+            return $this->normalizeImportedDateYear(Carbon::parse($value));
+        }
+    } catch (Throwable) {
+        return null;
+    }
+
+    return null;
+}
+
+private function importYear(): int
+{
+    $year = (int) (
+        $this->state['import_year']
+        ?? $this->state['year']
+        ?? $this->state['tahun']
+        ?? env('INVENTORY_IMPORT_YEAR', 2025)
+    );
+
+    return $year >= 2000 ? $year : 2025;
+}
+
+private function normalizeImportedDateYear(Carbon $date): ?Carbon
+{
+    if ($date->year >= 2000 && $date->year <= ((int) now()->format('Y')) + 1) {
+        return $date;
+    }
+
+    if ($date->year < 2000) {
         try {
-            if ($value instanceof \DateTimeInterface) {
-                return Carbon::instance($value);
-            }
-
-            if (is_numeric($value)) {
-                return Carbon::instance(ExcelDate::excelToDateTimeObject((float) $value));
-            }
-
-            if (is_string($value) && trim($value) !== '') {
-                return Carbon::parse($value);
-            }
+            return $date->copy()->setYear($this->importYear());
         } catch (Throwable) {
             return null;
         }
-
-        return null;
     }
+
+    return null;
+}
 
     private function toNumber(mixed $value): float
     {
@@ -1096,27 +2140,152 @@ class ProcessInventoryImportJob implements ShouldQueue
             return 0;
         }
 
-        if (is_numeric($value)) {
+        if (is_int($value) || is_float($value)) {
             return (float) $value;
         }
 
-        $clean = preg_replace('/[^0-9,.-]/', '', (string) $value);
-        $clean = str_replace('.', '', $clean);
-        $clean = str_replace(',', '.', $clean);
+        if ($value instanceof \DateTimeInterface) {
+            return 0;
+        }
 
-        return is_numeric($clean) ? (float) $clean : 0;
+        $text = trim((string) $value);
+
+        if ($text === '' || $text === '-' || str_starts_with($text, '#')) {
+            return 0;
+        }
+
+        $isNegative = false;
+
+        if (str_contains($text, '(') && str_contains($text, ')')) {
+            $isNegative = true;
+        }
+
+        if (str_starts_with($text, '-')) {
+            $isNegative = true;
+        }
+
+        $text = str_replace(
+            ["\xc2\xa0", ' ', 'Rp', 'rp', 'IDR', 'idr'],
+            '',
+            $text
+        );
+
+        $text = preg_replace('/[^0-9,.\-]/', '', $text);
+
+        if ($text === '' || $text === '-' || $text === null) {
+            return 0;
+        }
+
+        $text = str_replace('-', '', $text);
+
+        $hasComma = str_contains($text, ',');
+        $hasDot = str_contains($text, '.');
+
+        if ($hasComma && $hasDot) {
+            $lastComma = strrpos($text, ',');
+            $lastDot = strrpos($text, '.');
+
+            if ($lastDot > $lastComma) {
+                $text = str_replace(',', '', $text);
+            } else {
+                $text = str_replace('.', '', $text);
+                $text = str_replace(',', '.', $text);
+            }
+        } elseif ($hasComma) {
+            $commaCount = substr_count($text, ',');
+
+            if ($commaCount > 1) {
+                $text = str_replace(',', '', $text);
+            } else {
+                [$before, $after] = array_pad(explode(',', $text, 2), 2, '');
+
+                if (strlen($after) === 3 && strlen($before) <= 3) {
+                    $text = str_replace(',', '', $text);
+                } else {
+                    $text = str_replace(',', '.', $text);
+                }
+            }
+        } elseif ($hasDot) {
+            $dotCount = substr_count($text, '.');
+
+            if ($dotCount > 1) {
+                $lastDot = strrpos($text, '.');
+                $after = substr($text, $lastDot + 1);
+
+                if (strlen($after) === 3) {
+                    $text = str_replace('.', '', $text);
+                } else {
+                    $integerPart = substr($text, 0, $lastDot);
+                    $decimalPart = substr($text, $lastDot + 1);
+
+                    $text = str_replace('.', '', $integerPart) . '.' . $decimalPart;
+                }
+            } else {
+                [$before, $after] = array_pad(explode('.', $text, 2), 2, '');
+
+                if (strlen($after) === 3 && strlen($before) <= 3) {
+                    $text = str_replace('.', '', $text);
+                }
+            }
+        }
+
+        if (! is_numeric($text)) {
+            return 0;
+        }
+
+        $number = (float) $text;
+
+        return $isNegative ? -$number : $number;
+    }
+
+    private function isNonStockProductLine(string $productName): bool
+    {
+        $name = strtoupper(trim($productName));
+
+        if ($name === '' || $name === 'TOTAL') {
+            return true;
+        }
+
+        $nonStockKeywords = [
+            'ONGKIR',
+            'VACUM',
+            'VACUUM',
+            'KARUNG',
+            'PACKING',
+            'PAKING',
+            'BIAYA',
+            'JASA',
+            'DISKON',
+            'POTONGAN',
+            'ADMIN',
+            'FEE',
+            'PPN',
+            'PAJAK',
+        ];
+
+        foreach ($nonStockKeywords as $keyword) {
+            if (str_contains($name, $keyword)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function findProductByExcelName(string $productName): ?Product
     {
-        $productName = trim(preg_replace('/\s+/', ' ', $productName));
+        $productName = $this->cleanImportedProductName($productName);
+
+        if ($productName === '') {
+            return null;
+        }
 
         $columns = collect(['name', 'product_name', 'full_name', 'product_code', 'code', 'sku'])
             ->filter(fn (string $column): bool => DBSchema::hasColumn('products', $column))
             ->values();
 
         if ($columns->isEmpty()) {
-            return null;
+            return $this->createImportedProductFromName($productName);
         }
 
         $exact = Product::query()
@@ -1132,19 +2301,277 @@ class ProcessInventoryImportJob implements ShouldQueue
             return $exact;
         }
 
-        return Product::query()
-            ->where(function ($query) use ($columns, $productName): void {
-                foreach ($columns as $index => $column) {
-                    $method = $index === 0 ? 'where' : 'orWhere';
-                    $query->{$method}($column, 'like', '%' . $productName . '%');
+        $targetKeys = $this->productMatchKeys($productName);
+
+        $bestProductId = null;
+        $bestScore = 0;
+
+        Product::query()
+            ->select(array_values(array_unique(array_merge(['id'], $columns->all()))))
+            ->chunkById(500, function ($products) use ($columns, $targetKeys, &$bestProductId, &$bestScore): void {
+                foreach ($products as $product) {
+                    $candidateKeys = [];
+
+                    foreach ($columns as $column) {
+                        $value = $product->{$column} ?? null;
+
+                        if ($value !== null && trim((string) $value) !== '') {
+                            $candidateKeys = array_merge(
+                                $candidateKeys,
+                                $this->productMatchKeys((string) $value)
+                            );
+                        }
+                    }
+
+                    $candidateKeys = array_values(array_unique(array_filter($candidateKeys)));
+
+                    $score = $this->productMatchScore($targetKeys, $candidateKeys);
+
+                    if ($score > $bestScore) {
+                        $bestScore = $score;
+                        $bestProductId = (int) $product->id;
+                    }
                 }
-            })
-            ->first();
+            });
+
+        if ($bestProductId && $bestScore >= 92) {
+            return Product::query()
+                ->where('id', $bestProductId)
+                ->first();
+        }
+
+        return $this->createImportedProductFromName($productName);
+    }
+
+    private function cleanImportedProductName(string $productName): string
+    {
+        $productName = trim(preg_replace('/\s+/', ' ', $productName));
+        $productName = str_replace(['×', '*'], 'X', $productName);
+        $productName = preg_replace('/\s*[xX]\s*/', 'X', $productName);
+
+        return trim((string) $productName);
+    }
+
+    private function productMatchKeys(string $name): array
+    {
+        $name = strtoupper($this->cleanImportedProductName($name));
+
+        $plain = preg_replace('/[^A-Z0-9]+/', '', $name);
+
+        $withoutLeadingZeroNumbers = preg_replace_callback('/\d+/', function (array $matches): string {
+            return (string) ((int) $matches[0]);
+        }, $plain);
+
+        $dimensionNormalized = preg_replace_callback(
+            '/(\d+)\s*X\s*(\d+)\s*X\s*(\d+)/i',
+            function (array $matches): string {
+                return ((int) $matches[1]) . 'X' . ((int) $matches[2]) . 'X' . ((int) $matches[3]);
+            },
+            $name
+        );
+
+        $dimensionNormalized = preg_replace('/[^A-Z0-9]+/', '', strtoupper($dimensionNormalized));
+
+        return array_values(array_unique(array_filter([
+            $plain,
+            $withoutLeadingZeroNumbers,
+            $dimensionNormalized,
+        ])));
+    }
+
+    private function productMatchScore(array $targetKeys, array $candidateKeys): int
+    {
+        $bestScore = 0;
+
+        foreach ($targetKeys as $target) {
+            foreach ($candidateKeys as $candidate) {
+                if ($target === '' || $candidate === '') {
+                    continue;
+                }
+
+                if ($target === $candidate) {
+                    return 100;
+                }
+
+                if (str_contains($candidate, $target) || str_contains($target, $candidate)) {
+                    $bestScore = max($bestScore, 94);
+                    continue;
+                }
+
+                similar_text($target, $candidate, $percent);
+
+                $bestScore = max($bestScore, (int) round($percent));
+            }
+        }
+
+        return $bestScore;
+    }
+
+    private function createImportedProductFromName(string $productName): ?Product
+    {
+        if (! DBSchema::hasTable('products')) {
+            return null;
+        }
+
+        $productName = $this->cleanImportedProductName($productName);
+        $code = $this->nextImportedProductCode($productName);
+
+        $data = [
+            'code' => $code,
+            'product_code' => $code,
+            'sku' => $code,
+
+            'name' => $productName,
+            'product_name' => $productName,
+            'full_name' => $productName,
+
+            'description' => 'Auto create dari proses import Excel.',
+            'is_active' => true,
+            'status' => 'active',
+
+            'default_purchase_price' => 0,
+            'default_selling_price' => 0,
+            'purchase_price' => 0,
+            'selling_price' => 0,
+            'minimum_stock' => 0,
+            'min_stock' => 0,
+
+            'created_at' => now(),
+            'updated_at' => now(),
+        ];
+
+        $this->fillProductDefaultForeignKey($data, 'product_type_id', ['product_types']);
+        $this->fillProductDefaultForeignKey($data, 'product_density_id', ['product_densities']);
+        $this->fillProductDefaultForeignKey($data, 'product_category_id', ['product_categories', 'categories']);
+        $this->fillProductDefaultForeignKey($data, 'unit_id', ['units']);
+
+        try {
+            $insertData = $this->filterColumns('products', $data);
+
+            $productId = DB::table('products')->insertGetId($insertData);
+
+            return Product::query()
+                ->where('id', $productId)
+                ->first();
+        } catch (Throwable $e) {
+            report($e);
+
+            return null;
+        }
+    }
+
+    private function fillProductDefaultForeignKey(array &$data, string $column, array $tables): void
+    {
+        if (! DBSchema::hasColumn('products', $column)) {
+            return;
+        }
+
+        foreach ($tables as $table) {
+            if (! DBSchema::hasTable($table)) {
+                continue;
+            }
+
+            $id = DB::table($table)->orderBy('id')->value('id');
+
+            if ($id) {
+                $data[$column] = $id;
+                return;
+            }
+
+            $createdId = $this->createDefaultLookupRow($table);
+
+            if ($createdId) {
+                $data[$column] = $createdId;
+                return;
+            }
+        }
+
+        if ($this->isColumnNullable('products', $column)) {
+            $data[$column] = null;
+        }
+    }
+
+    private function createDefaultLookupRow(string $table): ?int
+    {
+        try {
+            $code = 'IMP-' . strtoupper(substr(md5($table), 0, 8));
+            $name = 'Import Default';
+
+            $data = [
+                'code' => $code,
+                'kode' => $code,
+                'name' => $name,
+                'nama' => $name,
+                'description' => 'Auto create default dari proses import Excel.',
+                'is_active' => true,
+                'status' => 'active',
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+
+            $insertData = $this->filterColumns($table, $data);
+
+            if (empty($insertData)) {
+                return null;
+            }
+
+            return (int) DB::table($table)->insertGetId($insertData);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function nextImportedProductCode(string $productName): string
+    {
+        $baseCode = 'PRD-IMP-' . strtoupper(substr(md5($productName), 0, 8));
+        $code = $baseCode;
+        $sequence = 1;
+
+        $codeColumns = collect(['code', 'product_code', 'sku'])
+            ->filter(fn (string $column): bool => DBSchema::hasColumn('products', $column))
+            ->values();
+
+        while ($codeColumns->isNotEmpty()) {
+            $exists = DB::table('products')
+                ->where(function ($query) use ($codeColumns, $code): void {
+                    foreach ($codeColumns as $index => $column) {
+                        $method = $index === 0 ? 'where' : 'orWhere';
+                        $query->{$method}($column, $code);
+                    }
+                })
+                ->exists();
+
+            if (! $exists) {
+                return $code;
+            }
+
+            $sequence++;
+            $code = $baseCode . '-' . $sequence;
+        }
+
+        return $code;
+    }
+
+    private function isColumnNullable(string $table, string $column): bool
+    {
+        try {
+            $database = DB::getDatabaseName();
+
+            $result = DB::table('information_schema.COLUMNS')
+                ->where('TABLE_SCHEMA', $database)
+                ->where('TABLE_NAME', $table)
+                ->where('COLUMN_NAME', $column)
+                ->value('IS_NULLABLE');
+
+            return strtoupper((string) $result) === 'YES';
+        } catch (Throwable) {
+            return true;
+        }
     }
 
     private function findOrCreateCustomer(?string $customerName): ?Customer
     {
-        if (! $customerName) {
+        if (! $customerName || ! DBSchema::hasTable('customers')) {
             return null;
         }
 
@@ -1185,15 +2612,11 @@ class ProcessInventoryImportJob implements ShouldQueue
 
     private function findOrCreateSupplier(?string $supplierName): ?Supplier
     {
-        if (! $supplierName) {
+        if (! $supplierName || ! DBSchema::hasTable('suppliers')) {
             return null;
         }
 
         $supplierName = trim(preg_replace('/\s+/', ' ', $supplierName));
-
-        if (! DBSchema::hasTable('suppliers')) {
-            return null;
-        }
 
         $nameColumn = collect(['supplier_name', 'name', 'nama_supplier', 'nama', 'company_name'])
             ->first(fn (string $column): bool => DBSchema::hasColumn('suppliers', $column));
@@ -1268,7 +2691,7 @@ class ProcessInventoryImportJob implements ShouldQueue
             })
             ->max() ?? 0;
 
-        return $prefix . '-' . str_pad((string) ($lastNumber + 1), 4, '0', STR_PAD_LEFT);
+        return $prefix . '-' . str_pad((string) ($lastNumber + 1), 4, '0', \STR_PAD_LEFT);
     }
 
     private function nextOutboundImportTransactionNumber(Carbon $date): string
@@ -1287,7 +2710,7 @@ class ProcessInventoryImportJob implements ShouldQueue
             })
             ->max() ?? 0;
 
-        return $prefix . '-' . str_pad((string) ($lastNumber + 1), 4, '0', STR_PAD_LEFT);
+        return $prefix . '-' . str_pad((string) ($lastNumber + 1), 4, '0', \STR_PAD_LEFT);
     }
 }
 

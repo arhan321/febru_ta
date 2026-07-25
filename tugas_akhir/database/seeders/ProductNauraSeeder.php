@@ -2,10 +2,10 @@
 
 namespace Database\Seeders;
 
+use RuntimeException;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
-use RuntimeException;
 
 class ProductNauraSeeder extends Seeder
 {
@@ -40,6 +40,7 @@ class ProductNauraSeeder extends Seeder
         $thicknessColumn = $this->firstColumn('products', ['thickness']);
         $sizeTextColumn = $this->firstColumn('products', ['size_text']);
         $descriptionColumn = $this->firstColumn('products', ['description']);
+        $logoPathColumn = $this->firstColumn('products', ['logo_path']);
 
         $unitId = $this->findOrCreateUnit('PCS');
         $userId = $this->defaultUserId();
@@ -69,6 +70,7 @@ class ProductNauraSeeder extends Seeder
             $thicknessColumn,
             $sizeTextColumn,
             $descriptionColumn,
+            $logoPathColumn,
             $unitId,
             $userId,
             &$processed
@@ -171,6 +173,12 @@ class ProductNauraSeeder extends Seeder
 
                 if (Schema::hasColumn('products', 'updated_by') && $userId) {
                     $data['updated_by'] = $userId;
+                }
+
+                 if ($logoPathColumn) {
+                    $data[$logoPathColumn] = $this->resolveLogoPath(
+                        ($item['catalog'] ?? '') . ' ' . ($item['name'] ?? '')
+                    );
                 }
 
                 DB::table('products')->updateOrInsert(
@@ -326,6 +334,53 @@ B64;
 
         return (int) DB::table($table)->insertGetId($this->filterColumns($table, $data));
     }
+
+    private function resolveLogoPath(string $productName): ?string
+{
+    $name = strtolower($productName);
+
+    /*
+    |--------------------------------------------------------------------------
+    | INOAC Group
+    |--------------------------------------------------------------------------
+    | EON masih termasuk produk INOAC, jadi menggunakan logo INOAC.
+    */
+    if (
+        str_contains($name, 'inoac') ||
+        str_contains($name, 'eon')
+    ) {
+        return 'product/logos/Inoac.png';
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Quantum
+    |--------------------------------------------------------------------------
+    */
+    if (str_contains($name, 'quantum')) {
+        return 'product/logos/quantum.png';
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Royal Foam
+    |--------------------------------------------------------------------------
+    */
+    if (str_contains($name, 'royal')) {
+        return 'product/logos/Royal.jpg';
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Tajima
+    |--------------------------------------------------------------------------
+    */
+    if (str_contains($name, 'tajima')) {
+        return 'product/logos/tajima.png';
+    }
+
+    return 'product/logos/default.png';
+}
 
     private function defaultUserId(): ?int
     {

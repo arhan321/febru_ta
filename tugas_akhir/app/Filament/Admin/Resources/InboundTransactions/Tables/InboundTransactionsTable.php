@@ -2,22 +2,22 @@
 
 namespace App\Filament\Admin\Resources\InboundTransactions\Tables;
 
-use App\Models\InboundTransaction;
-use App\Services\InventoryApprovalService;
+use Throwable;
+use Filament\Tables\Table;
 use Filament\Actions\Action;
-use Filament\Actions\BulkActionGroup;
-use Filament\Actions\DeleteBulkAction;
 use Filament\Actions\EditAction;
 use Filament\Actions\ViewAction;
-use Filament\Forms\Components\DatePicker;
-use Filament\Forms\Components\Textarea;
-use Filament\Notifications\Notification;
-use Filament\Tables\Columns\TextColumn;
+use App\Models\InboundTransaction;
 use Filament\Tables\Filters\Filter;
+use Filament\Actions\BulkActionGroup;
+use Filament\Actions\DeleteBulkAction;
+use Filament\Forms\Components\Textarea;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Notifications\Notification;
+use Filament\Forms\Components\DatePicker;
 use Filament\Tables\Filters\SelectFilter;
-use Filament\Tables\Table;
 use Illuminate\Database\Eloquent\Builder;
-use Throwable;
+use App\Services\InventoryApprovalService;
 
 class InboundTransactionsTable
 {
@@ -74,8 +74,23 @@ class InboundTransactionsTable
                 TextColumn::make('grand_total')
                     ->label('Total')
                     ->money('IDR')
-                    ->sortable()
-                    ->toggleable(),
+                    ->sortable(),
+
+                TextColumn::make('source')
+                    ->label('Sumber')
+                    ->badge()
+                    ->formatStateUsing(fn (?string $state): string => match ($state) {
+                        'import_excel' => 'Import Excel',
+                        'import_database' => 'Import Database',
+                        null, '' => 'Manual',
+                        default => ucfirst(str_replace('_', ' ', $state)),
+                    })
+                    ->color(fn (?string $state): string => match ($state) {
+                        'import_excel' => 'info',
+                        'import_database' => 'warning',
+                        default => 'gray',
+                    })
+                    ->toggleable(isToggledHiddenByDefault: true),
 
                 TextColumn::make('submittedBy.name')
                     ->label('Dibuat Oleh')

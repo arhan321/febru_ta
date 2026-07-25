@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Filament\Admin\Widgets;
+namespace App\Filament\Admin\DataWarehouseWidgets;
 
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -14,24 +14,11 @@ class DataWarehouseEtlInfoWidget extends StatsOverviewWidget
 
     protected static ?int $sort = 2;
 
+    protected static ?string $pollingInterval = null;
+
     public static function canView(): bool
     {
-         $routeName = request()->route()?->getName();
-
-    if ($routeName === 'filament.admin.pages.data-warehouse-dashboard') {
         return true;
-    }
-
-    $referer = request()->headers->get('referer');
-
-    if (is_string($referer)) {
-        $path = parse_url($referer, PHP_URL_PATH);
-
-        return is_string($path)
-            && str_starts_with($path, '/admin/data-warehouse-dashboard');
-    }
-
-    return false;
     }
 
     protected function getStats(): array

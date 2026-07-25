@@ -2,13 +2,14 @@
 
 namespace App\Filament\Admin\Resources\Products\Schemas;
 
+use Filament\Schemas\Schema;
 use Filament\Forms\Components\Select;
-use Filament\Forms\Components\Textarea;
-use Filament\Forms\Components\TextInput;
 use Filament\Forms\Components\Toggle;
 use Filament\Schemas\Components\Grid;
+use Filament\Forms\Components\Textarea;
+use Filament\Forms\Components\TextInput;
 use Filament\Schemas\Components\Section;
-use Filament\Schemas\Schema;
+use Filament\Forms\Components\FileUpload;
 
 class ProductForm
 {
@@ -32,6 +33,19 @@ class ProductForm
                                         'default' => 12,
                                         'md' => 4,
                                     ]),
+
+                                    FileUpload::make('logo_path')
+                                    ->label('Logo Produk')
+                                    ->image()
+                                    ->imageEditor()
+                                    ->disk('public')
+                                    ->directory('product/logos')
+                                    ->visibility('public')
+                                    ->acceptedFileTypes(['image/jpeg', 'image/png', 'image/webp'])
+                                    ->maxSize(2048)
+                                    ->downloadable()
+                                    ->openable()
+                                    ->columnSpanFull(),
 
                                 TextInput::make('name')
                                     ->label('Nama Produk')

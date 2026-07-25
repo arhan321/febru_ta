@@ -549,7 +549,7 @@
 
             <div class="dw-widget-wrap">
                 @livewire(
-                    \App\Filament\Admin\Widgets\DataWarehouseEtlInfoWidget::class,
+                    \App\Filament\Admin\DataWarehouseWidgets\DataWarehouseEtlInfoWidget::class,
                     [],
                     key('dw-etl-info')
                 )
@@ -593,7 +593,7 @@
                         Periode Cepat
                     </label>
 
-                    <select wire:model.live="period" class="dw-select">
+                    <select wire:model.change="period" class="dw-select">
                         @foreach ($this->getPeriodOptions() as $value => $label)
                             <option value="{{ $value }}">
                                 {{ $label }}
@@ -609,7 +609,7 @@
 
                     <input
                         type="date"
-                        wire:model.live="startDate"
+                        wire:model.change="startDate"
                         class="dw-input"
                     >
                 </div>
@@ -621,7 +621,7 @@
 
                     <input
                         type="date"
-                        wire:model.live="endDate"
+                        wire:model.change="endDate"
                         class="dw-input"
                     >
                 </div>
@@ -631,7 +631,7 @@
                         Gudang
                     </label>
 
-                    <select wire:model.live="warehouseId" class="dw-select">
+                    <select wire:model.change="warehouseId" class="dw-select">
                         <option value="">
                             Semua Gudang
                         </option>
@@ -649,7 +649,7 @@
                         Produk
                     </label>
 
-                    <select wire:model.live="productId" class="dw-select">
+                    <select wire:model.change="productId" class="dw-select">
                         <option value="">
                             Semua Produk
                         </option>
@@ -667,7 +667,7 @@
                         Kategori Produk
                     </label>
 
-                    <select wire:model.live="productCategory" class="dw-select">
+                    <select wire:model.change="productCategory" class="dw-select">
                         <option value="">
                             Semua Kategori
                         </option>
@@ -712,7 +712,7 @@
 
             <div class="dw-widget-wrap">
                 @livewire(
-                    \App\Filament\Admin\Widgets\DataWarehouseOverviewWidget::class,
+                    \App\Filament\Admin\DataWarehouseWidgets\DataWarehouseOverviewWidget::class,
                     [
                         'period' => $period,
                         'startDate' => $startDate,
@@ -748,7 +748,7 @@
                         Tahun Grafik
                     </label>
 
-                    <select wire:model.live="chartYear" class="dw-select">
+                    <select wire:model.change="chartYear" class="dw-select">
                         <option value="">
                             Ikuti Filter Utama
                         </option>
@@ -765,7 +765,7 @@
             <div class="dw-chart-grid">
                 <div class="dw-widget-wrap">
                     @livewire(
-                        \App\Filament\Admin\Widgets\DataWarehouseMovementTrendChart::class,
+                        \App\Filament\Admin\DataWarehouseWidgets\DataWarehouseMovementTrendChart::class,
                         [
                             'period' => $period,
                             'startDate' => $startDate,
@@ -781,7 +781,7 @@
 
                 <div class="dw-widget-wrap">
                     @livewire(
-                        \App\Filament\Admin\Widgets\DataWarehouseTopProductMovementChart::class,
+                        \App\Filament\Admin\DataWarehouseWidgets\DataWarehouseTopProductMovementChart::class,
                         [
                             'period' => $period,
                             'startDate' => $startDate,

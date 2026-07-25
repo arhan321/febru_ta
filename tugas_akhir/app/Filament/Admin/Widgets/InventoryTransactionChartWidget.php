@@ -2,18 +2,20 @@
 
 namespace App\Filament\Admin\Widgets;
 
-use App\Models\InboundTransaction;
-use App\Models\OutboundTransaction;
 use Filament\Widgets\ChartWidget;
+use App\Models\InboundTransaction;
 use Illuminate\Support\Collection;
+use App\Models\OutboundTransaction;
 
 class InventoryTransactionChartWidget extends ChartWidget
 {
     protected ?string $heading = 'Grafik Transaksi Inventory';
 
-    protected ?string $description = 'Perbandingan barang masuk dan barang keluar yang sudah disetujui dalam 6 bulan terakhir.';
+    protected ?string $description = 'Perbandingan barang masuk dan barang keluar yang sudah disetujui berdasarkan tanggal transaksi dalam 6 bulan terakhir.';
 
     protected static ?int $sort = 2;
+
+    protected int|string|array $columnSpan = 'full';
 
     protected function getData(): array
     {
@@ -48,9 +50,9 @@ class InventoryTransactionChartWidget extends ChartWidget
             ->map(function ($date): int {
                 return InboundTransaction::query()
                     ->where('status', 'approved')
-                    ->whereBetween('approved_at', [
-                        $date->copy()->startOfMonth(),
-                        $date->copy()->endOfMonth(),
+                    ->whereBetween('transaction_date', [
+                        $date->copy()->startOfMonth()->toDateString(),
+                        $date->copy()->endOfMonth()->toDateString(),
                     ])
                     ->count();
             })
@@ -63,9 +65,9 @@ class InventoryTransactionChartWidget extends ChartWidget
             ->map(function ($date): int {
                 return OutboundTransaction::query()
                     ->where('status', 'approved')
-                    ->whereBetween('approved_at', [
-                        $date->copy()->startOfMonth(),
-                        $date->copy()->endOfMonth(),
+                    ->whereBetween('transaction_date', [
+                        $date->copy()->startOfMonth()->toDateString(),
+                        $date->copy()->endOfMonth()->toDateString(),
                     ])
                     ->count();
             })

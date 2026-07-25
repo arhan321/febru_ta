@@ -1,8 +1,8 @@
 <?php
 
-use Illuminate\Database\Migrations\Migration;
-use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\Migrations\Migration;
 
 return new class extends Migration
 {
@@ -100,8 +100,12 @@ return new class extends Migration
 
             $table->decimal('qty', 15, 2);
 
-            $table->decimal('unit_cost', 15, 2)->default(0);
-            $table->decimal('subtotal', 15, 2)->default(0);
+            $table->decimal('volume_m3', 20, 6)->nullable();
+            $table->decimal('price_per_m3', 20, 2)->nullable();
+            $table->decimal('excel_subtotal', 20, 2)->nullable();
+
+            $table->decimal('unit_cost', 20, 2)->default(0);
+            $table->decimal('subtotal', 20, 2)->default(0);
 
             $table->string('product_code_snapshot')->nullable();
             $table->string('product_name_snapshot')->nullable();
