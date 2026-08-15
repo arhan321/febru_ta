@@ -10,6 +10,7 @@ use App\Models\Product;
 use App\Models\Customer;
 use App\Models\Supplier;
 use App\Models\Warehouse;
+use Illuminate\Support\Str;
 use App\Models\StockBalance;
 use App\Models\AssetCategory;
 use App\Models\AssetLocation;
@@ -22,6 +23,30 @@ use Illuminate\Support\Facades\Schema;
 
 class SyncInventoryDataWarehouse extends Command
 {
+    public const IMPLEMENTATION_VERSION = 'ETL-FIX-2026-07-28-V3';
+
+    private const APPROVED_TRANSACTION_STATUS = 'approved';
+
+    private const DIMENSION_TABLES = [
+        'dw_dim_dates',
+        'dw_dim_products',
+        'dw_dim_warehouses',
+        'dw_dim_suppliers',
+        'dw_dim_customers',
+        'dw_dim_users',
+        'dw_dim_asset_categories',
+        'dw_dim_asset_locations',
+        'dw_dim_assets',
+    ];
+
+    private const FACT_TABLES = [
+        'dw_fact_inventory_movements',
+        'dw_fact_inbound_transactions',
+        'dw_fact_outbound_transactions',
+        'dw_fact_stock_snapshots',
+        'dw_fact_asset_snapshots',
+    ];
+
     protected $signature = 'dw:sync-inventory';
 
     protected $description = 'Sync operational inventory data into data warehouse tables.';
@@ -30,19 +55,35 @@ class SyncInventoryDataWarehouse extends Command
     {
         $this->info('Starting inventory data warehouse sync...');
 
+        $startedAt = now();
+        $etlRunId = $this->startEtlRun($startedAt);
+
         try {
             DB::transaction(function (): void {
                 $this->syncDimensions();
                 $this->syncFacts();
             });
 
+            $this->completeEtlRun($etlRunId, $startedAt);
+
             $this->info('Inventory data warehouse sync completed successfully.');
 
             return self::SUCCESS;
         } catch (Throwable $e) {
+            $this->failEtlRun($etlRunId, $startedAt, $e);
+
             $this->error('Sync failed: ' . $e->getMessage());
 
             report($e);
+
+            /*
+             * During automated tests, expose the original exception and stack
+             * trace instead of reducing every failure to console exit code 1.
+             * Non-testing environments keep the normal, controlled CLI failure.
+             */
+            if (app()->runningUnitTests()) {
+                throw $e;
+            }
 
             return self::FAILURE;
         }
@@ -263,7 +304,7 @@ class SyncInventoryDataWarehouse extends Command
             ->orderBy('item.id')
             ->select($select);
 
-        $this->applyDataWarehouseTransactionStatusFilter($query, 'inbound_transactions', 'trx');
+        $this->applyApprovedTransactionFilter($query, 'inbound_transactions', 'trx');
 
         foreach ($query->get() as $row) {
             $date = $this->dateFromTransaction(
@@ -382,7 +423,7 @@ class SyncInventoryDataWarehouse extends Command
             ->orderBy('item.id')
             ->select($select);
 
-        $this->applyDataWarehouseTransactionStatusFilter($query, 'outbound_transactions', 'trx');
+        $this->applyApprovedTransactionFilter($query, 'outbound_transactions', 'trx');
 
         foreach ($query->get() as $row) {
             $date = $this->dateFromTransaction(
@@ -521,7 +562,14 @@ class SyncInventoryDataWarehouse extends Command
 
     private function syncFactInboundTransactions(): void
     {
+        $this->deleteUnapprovedTransactionFacts(
+            'dw_fact_inbound_transactions',
+            'source_inbound_id',
+            'inbound_transactions'
+        );
+
         InboundTransaction::query()
+            ->where('status', self::APPROVED_TRANSACTION_STATUS)
             ->with(['items'])
             ->chunkById(100, function ($transactions): void {
                 foreach ($transactions as $transaction) {
@@ -577,7 +625,14 @@ class SyncInventoryDataWarehouse extends Command
 
     private function syncFactOutboundTransactions(): void
     {
+        $this->deleteUnapprovedTransactionFacts(
+            'dw_fact_outbound_transactions',
+            'source_outbound_id',
+            'outbound_transactions'
+        );
+
         OutboundTransaction::query()
+            ->where('status', self::APPROVED_TRANSACTION_STATUS)
             ->with(['items'])
             ->chunkById(100, function ($transactions): void {
                 foreach ($transactions as $transaction) {
@@ -857,37 +912,165 @@ class SyncInventoryDataWarehouse extends Command
             return null;
         }
 
-        if ($this->isColumnNullable('dw_fact_inventory_movements', 'source_stock_movement_id')) {
-            return null;
-        }
-
+        /*
+         * Transaction items do not have rows in stock_movements when operational
+         * stock updates are disabled. Keep a deterministic, non-null surrogate ID
+         * so the same item is idempotent on both MySQL and SQLite test databases.
+         */
         return $type === 'in'
             ? 1000000000 + $itemId
             : 2000000000 + $itemId;
     }
 
-    private function applyDataWarehouseTransactionStatusFilter($query, string $tableName, string $alias): void
+    private function applyApprovedTransactionFilter($query, string $tableName, string $alias): void
     {
         if (! Schema::hasColumn($tableName, 'status')) {
+            $query->whereRaw('1 = 0');
+
             return;
         }
 
-        $excludedStatuses = [
-            'cancelled',
-            'canceled',
-            'rejected',
-            'ditolak',
-            'batal',
-            'void',
-            'failed',
-            'draft',
-        ];
+        $query->where($alias . '.status', self::APPROVED_TRANSACTION_STATUS);
+    }
 
-        $query->where(function ($statusQuery) use ($alias, $excludedStatuses): void {
-            $statusQuery
-                ->whereNull($alias . '.status')
-                ->orWhereNotIn(DB::raw('LOWER(' . $alias . '.status)'), $excludedStatuses);
-        });
+    private function deleteUnapprovedTransactionFacts(
+        string $factTable,
+        string $sourceIdColumn,
+        string $sourceTable
+    ): void {
+        if (
+            ! Schema::hasTable($factTable)
+            || ! Schema::hasColumn($factTable, $sourceIdColumn)
+            || ! Schema::hasColumn($factTable, 'status')
+            || ! Schema::hasTable($sourceTable)
+            || ! Schema::hasColumn($sourceTable, 'status')
+        ) {
+            return;
+        }
+
+        DB::table($factTable)
+            ->where(function ($query): void {
+                $query
+                    ->whereNull('status')
+                    ->orWhere('status', '!=', self::APPROVED_TRANSACTION_STATUS);
+            })
+            ->delete();
+
+        DB::table($factTable)
+            ->whereIn($sourceIdColumn, function ($query) use ($sourceTable): void {
+                $query
+                    ->select('id')
+                    ->from($sourceTable)
+                    ->where(function ($statusQuery): void {
+                        $statusQuery
+                            ->whereNull('status')
+                            ->orWhere('status', '!=', self::APPROVED_TRANSACTION_STATUS);
+                    });
+            })
+            ->delete();
+    }
+
+    private function startEtlRun(Carbon $startedAt): ?int
+    {
+        if (! Schema::hasTable('dw_etl_runs')) {
+            return null;
+        }
+
+        try {
+            return DB::table('dw_etl_runs')->insertGetId([
+                'run_uuid' => (string) Str::uuid(),
+                'status' => 'running',
+                'dimension_rows' => 0,
+                'fact_rows' => 0,
+                'table_row_counts' => null,
+                'error_message' => null,
+                'started_at' => $startedAt,
+                'finished_at' => null,
+                'duration_ms' => null,
+                'created_at' => $startedAt,
+                'updated_at' => $startedAt,
+            ]);
+        } catch (Throwable $e) {
+            report($e);
+
+            return null;
+        }
+    }
+
+    private function completeEtlRun(?int $etlRunId, Carbon $startedAt): void
+    {
+        if (! $etlRunId || ! Schema::hasTable('dw_etl_runs')) {
+            return;
+        }
+
+        try {
+            $finishedAt = now();
+            $rowCounts = $this->dataWarehouseRowCounts();
+
+            DB::table('dw_etl_runs')
+                ->where('id', $etlRunId)
+                ->update([
+                    'status' => 'success',
+                    'dimension_rows' => $this->sumTableRows($rowCounts, self::DIMENSION_TABLES),
+                    'fact_rows' => $this->sumTableRows($rowCounts, self::FACT_TABLES),
+                    'table_row_counts' => json_encode($rowCounts, JSON_THROW_ON_ERROR),
+                    'error_message' => null,
+                    'finished_at' => $finishedAt,
+                    'duration_ms' => $this->durationInMilliseconds($startedAt, $finishedAt),
+                    'updated_at' => $finishedAt,
+                ]);
+        } catch (Throwable $e) {
+            report($e);
+        }
+    }
+
+    private function failEtlRun(?int $etlRunId, Carbon $startedAt, Throwable $exception): void
+    {
+        if (! $etlRunId || ! Schema::hasTable('dw_etl_runs')) {
+            return;
+        }
+
+        try {
+            $finishedAt = now();
+
+            DB::table('dw_etl_runs')
+                ->where('id', $etlRunId)
+                ->update([
+                    'status' => 'failed',
+                    'error_message' => mb_substr($exception->getMessage(), 0, 65535),
+                    'finished_at' => $finishedAt,
+                    'duration_ms' => $this->durationInMilliseconds($startedAt, $finishedAt),
+                    'updated_at' => $finishedAt,
+                ]);
+        } catch (Throwable $e) {
+            report($e);
+        }
+    }
+
+    private function dataWarehouseRowCounts(): array
+    {
+        $rowCounts = [];
+
+        foreach (array_merge(self::DIMENSION_TABLES, self::FACT_TABLES) as $table) {
+            if (Schema::hasTable($table)) {
+                $rowCounts[$table] = DB::table($table)->count();
+            }
+        }
+
+        return $rowCounts;
+    }
+
+    private function sumTableRows(array $rowCounts, array $tables): int
+    {
+        return array_sum(array_map(
+            fn (string $table): int => (int) ($rowCounts[$table] ?? 0),
+            $tables
+        ));
+    }
+
+    private function durationInMilliseconds(Carbon $startedAt, Carbon $finishedAt): int
+    {
+        return max(0, (int) round($startedAt->diffInMilliseconds($finishedAt)));
     }
 
     private function dateFromTransaction($transactionDate, $transactionCreatedAt, $itemCreatedAt): Carbon
@@ -926,23 +1109,6 @@ class SyncInventoryDataWarehouse extends Command
         return collect($data)
             ->filter(fn ($value, string $column): bool => Schema::hasColumn($table, $column))
             ->all();
-    }
-
-    private function isColumnNullable(string $table, string $column): bool
-    {
-        try {
-            $database = DB::getDatabaseName();
-
-            $result = DB::table('information_schema.COLUMNS')
-                ->where('TABLE_SCHEMA', $database)
-                ->where('TABLE_NAME', $table)
-                ->where('COLUMN_NAME', $column)
-                ->value('IS_NULLABLE');
-
-            return strtoupper((string) $result) === 'YES';
-        } catch (Throwable) {
-            return true;
-        }
     }
 
     private function getAssetCategoryDimId(?int $sourceId): ?int

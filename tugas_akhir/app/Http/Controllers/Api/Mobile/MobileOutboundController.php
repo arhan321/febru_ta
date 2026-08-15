@@ -9,6 +9,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 
 final class MobileOutboundController extends Controller
@@ -151,17 +152,7 @@ final class MobileOutboundController extends Controller
             $subTotal = 0;
 
             foreach ($validated['items'] as $item) {
-                $product = DB::table('products')
-                    ->where('id', $item['product_id'])
-                    ->first([
-                        'id',
-                        'code',
-                        'name',
-                        'full_name',
-                        'unit_id',
-                        'last_selling_price',
-                        'default_selling_price',
-                    ]);
+                $product = $this->productForOutbound((int) $item['product_id']);
 
                 $qty = (float) $item['qty'];
 
@@ -188,9 +179,7 @@ final class MobileOutboundController extends Controller
                     ], 422));
                 }
 
-                $unitPrice = isset($item['unit_price'])
-                    ? (float) $item['unit_price']
-                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+                $unitPrice = $this->resolveOutboundUnitPrice($item, $product);
 
                 $itemDiscount = isset($item['discount_amount'])
                     ? (float) $item['discount_amount']
@@ -240,17 +229,7 @@ final class MobileOutboundController extends Controller
             ]);
 
             foreach ($validated['items'] as $item) {
-                $product = DB::table('products')
-                    ->where('id', $item['product_id'])
-                    ->first([
-                        'id',
-                        'code',
-                        'name',
-                        'full_name',
-                        'unit_id',
-                        'last_selling_price',
-                        'default_selling_price',
-                    ]);
+                $product = $this->productForOutbound((int) $item['product_id']);
 
                 $stockBalance = DB::table('stock_balances')
                     ->where('product_id', $product->id)
@@ -263,9 +242,7 @@ final class MobileOutboundController extends Controller
 
                 $qty = (float) $item['qty'];
 
-                $unitPrice = isset($item['unit_price'])
-                    ? (float) $item['unit_price']
-                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+                $unitPrice = $this->resolveOutboundUnitPrice($item, $product);
 
                 $itemDiscount = isset($item['discount_amount'])
                     ? (float) $item['discount_amount']
@@ -467,17 +444,7 @@ final class MobileOutboundController extends Controller
             $subTotal = 0;
 
             foreach ($validated['items'] as $item) {
-                $product = DB::table('products')
-                    ->where('id', $item['product_id'])
-                    ->first([
-                        'id',
-                        'code',
-                        'name',
-                        'full_name',
-                        'unit_id',
-                        'last_selling_price',
-                        'default_selling_price',
-                    ]);
+                $product = $this->productForOutbound((int) $item['product_id']);
 
                 $qty = (float) $item['qty'];
 
@@ -504,9 +471,7 @@ final class MobileOutboundController extends Controller
                     ], 422));
                 }
 
-                $unitPrice = isset($item['unit_price'])
-                    ? (float) $item['unit_price']
-                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+                $unitPrice = $this->resolveOutboundUnitPrice($item, $product);
 
                 $itemDiscount = isset($item['discount_amount'])
                     ? (float) $item['discount_amount']
@@ -557,17 +522,7 @@ final class MobileOutboundController extends Controller
                 ->delete();
 
             foreach ($validated['items'] as $item) {
-                $product = DB::table('products')
-                    ->where('id', $item['product_id'])
-                    ->first([
-                        'id',
-                        'code',
-                        'name',
-                        'full_name',
-                        'unit_id',
-                        'last_selling_price',
-                        'default_selling_price',
-                    ]);
+                $product = $this->productForOutbound((int) $item['product_id']);
 
                 $stockBalance = DB::table('stock_balances')
                     ->where('product_id', $product->id)
@@ -580,9 +535,7 @@ final class MobileOutboundController extends Controller
 
                 $qty = (float) $item['qty'];
 
-                $unitPrice = isset($item['unit_price'])
-                    ? (float) $item['unit_price']
-                    : (float) ($product->last_selling_price ?: $product->default_selling_price ?: 0);
+                $unitPrice = $this->resolveOutboundUnitPrice($item, $product);
 
                 $itemDiscount = isset($item['discount_amount'])
                     ? (float) $item['discount_amount']
@@ -848,6 +801,122 @@ final class MobileOutboundController extends Controller
                 'approval_note' => $transaction->approval_note,
             ],
         ]);
+    }
+
+    /**
+     * Ambil data produk untuk kebutuhan barang keluar.
+     *
+     * Controller dibuat aman untuk beberapa kemungkinan nama kolom harga jual,
+     * karena dari mobile unit_price bisa terkirim 0. Jika unit_price dari mobile 0,
+     * sistem akan mengambil harga dari master produk.
+     */
+    private function productForOutbound(int $productId): object
+    {
+        $candidateColumns = [
+            'id',
+            'code',
+            'name',
+            'full_name',
+            'unit_id',
+            'last_selling_price',
+            'default_selling_price',
+            'selling_price',
+            'sale_price',
+            'price',
+            'harga_jual',
+            'retail_price',
+        ];
+
+        $columns = [];
+
+        foreach ($candidateColumns as $column) {
+            if (Schema::hasColumn('products', $column)) {
+                $columns[] = $column;
+            }
+        }
+
+        if ($columns === []) {
+            $columns = ['id'];
+        }
+
+        $product = DB::table('products')
+            ->where('id', $productId)
+            ->first($columns);
+
+        if (! $product) {
+            abort(response()->json([
+                'success' => false,
+                'message' => 'Produk tidak ditemukan.',
+                'errors' => [
+                    'product_id' => ['Produk tidak ditemukan.'],
+                ],
+            ], 422));
+        }
+
+        foreach ($candidateColumns as $column) {
+            if (! property_exists($product, $column)) {
+                $product->{$column} = null;
+            }
+        }
+
+        return $product;
+    }
+
+    private function resolveOutboundUnitPrice(array $item, object $product): float
+    {
+        $inputUnitPrice = $this->moneyToFloat($item['unit_price'] ?? null);
+
+        if ($inputUnitPrice > 0) {
+            return $inputUnitPrice;
+        }
+
+        $priceColumns = [
+            'last_selling_price',
+            'default_selling_price',
+            'selling_price',
+            'sale_price',
+            'price',
+            'harga_jual',
+            'retail_price',
+        ];
+
+        foreach ($priceColumns as $column) {
+            $price = $this->moneyToFloat($product->{$column} ?? null);
+
+            if ($price > 0) {
+                return $price;
+            }
+        }
+
+        return 0;
+    }
+
+    private function moneyToFloat(mixed $value): float
+    {
+        if ($value === null) {
+            return 0;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (float) $value;
+        }
+
+        $text = trim((string) $value);
+
+        if ($text === '' || $text === '-') {
+            return 0;
+        }
+
+        $text = str_replace(['Rp', 'rp', 'IDR', 'idr', ' '], '', $text);
+
+        if (str_contains($text, ',')) {
+            $text = str_replace('.', '', $text);
+            $text = str_replace(',', '.', $text);
+
+            return (float) $text;
+        }
+
+        return (float) preg_replace('/[^0-9.]/', '', $text);
     }
 
     /**

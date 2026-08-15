@@ -5,6 +5,7 @@ services:
     image: php:latest
     container_name: project
     hostname: "project"
+    restart: unless-stopped
     volumes:
       - ./tugas_akhir:/var/www/html
       - ./php/www.conf:/usr/local/etc/php-fpm.d/www.conf
@@ -35,6 +36,7 @@ services:
     build: ./nginx
     image: nginx:latest
     container_name: nginx_project
+    restart: unless-stopped
     hostname: "nginx_project"
     ports:
       - "28:80"

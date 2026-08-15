@@ -2,16 +2,17 @@
 
 namespace App\Filament\Admin\Pages;
 
+use Throwable;
 use BackedEnum;
 use Carbon\Carbon;
-use Filament\Notifications\Notification;
 use Filament\Pages\Page;
 use Filament\Support\Enums\Width;
-use Illuminate\Database\Query\Builder;
-use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Schema;
-use Throwable;
+use Illuminate\Support\Facades\Artisan;
+use Filament\Notifications\Notification;
+use App\Services\DataWarehouse\InventoryBiAnalyticsService;
 
 class DataWarehouseDashboard extends Page
 {
@@ -19,9 +20,9 @@ class DataWarehouseDashboard extends Page
 
     protected static string|\UnitEnum|null $navigationGroup = 'Data Warehouse';
 
-    protected static ?string $navigationLabel = 'Analitik Persediaan';
+    protected static ?string $navigationLabel = 'Analitik Inventori';
 
-    protected static ?string $title = 'Dashboard Analitik Persediaan';
+    protected static ?string $title = 'Dashboard Analitik Inventori';
 
     protected static ?int $navigationSort = 1;
 
@@ -294,6 +295,18 @@ class DataWarehouseDashboard extends Page
         return $this->productCategory ?: 'Semua Kategori';
     }
 
+    public function getAdvancedAnalytics(): array
+    {
+        return app(InventoryBiAnalyticsService::class)->dashboard([
+            'period' => $this->period,
+            'startDate' => $this->startDate,
+            'endDate' => $this->endDate,
+            'warehouseId' => $this->warehouseId,
+            'productId' => $this->productId,
+            'productCategory' => $this->productCategory,
+        ]);
+    }
+
     public function getPeriodRange(): array
     {
         if ($this->startDate || $this->endDate) {
@@ -432,7 +445,7 @@ class DataWarehouseDashboard extends Page
 
             Notification::make()
                 ->title('Sinkronisasi Data Warehouse Berhasil')
-                ->body('Data analitik persediaan telah diperbarui dari database operasional.')
+                ->body('Data analitik inventori telah diperbarui dari database operasional.')
                 ->success()
                 ->send();
         } catch (Throwable $e) {

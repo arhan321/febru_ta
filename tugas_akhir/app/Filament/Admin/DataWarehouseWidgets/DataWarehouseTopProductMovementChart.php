@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Schema;
 
 class DataWarehouseTopProductMovementChart extends ChartWidget
 {
-    protected ?string $heading = 'Top Produk Berdasarkan Qty Keluar';
+    protected ?string $heading = '10 Produk dengan Qty Keluar Tertinggi';
 
     protected static ?int $sort = 4;
 
@@ -82,8 +82,19 @@ class DataWarehouseTopProductMovementChart extends ChartWidget
                     'data' => $rows->pluck('total_qty_out')
                         ->map(fn ($value) => (float) $value)
                         ->toArray(),
-                    'backgroundColor' => '#ef4444',
-                    'borderColor' => '#dc2626',
+                    'backgroundColor' => [
+                        '#2563eb',
+                        '#3b82f6',
+                        '#0ea5e9',
+                        '#06b6d4',
+                        '#14b8a6',
+                        '#10b981',
+                        '#22c55e',
+                        '#84cc16',
+                        '#a3e635',
+                        '#bef264',
+                    ],
+                    'borderColor' => '#ffffff',
                     'borderWidth' => 1,
                     'borderRadius' => 8,
                     'barThickness' => 22,

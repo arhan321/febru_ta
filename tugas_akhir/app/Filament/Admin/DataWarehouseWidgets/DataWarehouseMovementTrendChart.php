@@ -10,7 +10,7 @@ use Illuminate\Support\Facades\Schema;
 
 class DataWarehouseMovementTrendChart extends ChartWidget
 {
-    protected ?string $heading = 'Tren Qty Barang Masuk dan Keluar per Bulan';
+    protected ?string $heading = 'Tren Pergerakan Barang per Bulan';
 
     protected static ?int $sort = 3;
 
@@ -68,6 +68,7 @@ class DataWarehouseMovementTrendChart extends ChartWidget
                         ->toArray(),
                     'borderColor' => '#16a34a',
                     'backgroundColor' => 'rgba(22, 163, 74, 0.16)',
+                    'borderWidth' => 3,
                     'tension' => 0.35,
                     'fill' => true,
                     'pointRadius' => 3,
@@ -80,6 +81,7 @@ class DataWarehouseMovementTrendChart extends ChartWidget
                         ->toArray(),
                     'borderColor' => '#dc2626',
                     'backgroundColor' => 'rgba(220, 38, 38, 0.10)',
+                    'borderWidth' => 3,
                     'tension' => 0.35,
                     'fill' => true,
                     'pointRadius' => 3,
@@ -102,6 +104,10 @@ class DataWarehouseMovementTrendChart extends ChartWidget
         return [
             'responsive' => true,
             'maintainAspectRatio' => false,
+            'interaction' => [
+                'mode' => 'index',
+                'intersect' => false,
+            ],
             'plugins' => [
                 'legend' => [
                     'position' => 'bottom',

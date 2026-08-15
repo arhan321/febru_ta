@@ -10,7 +10,9 @@ Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-Schedule::command('dw:sync-inventory')
+Schedule::command('dw:sync-and-reconcile')
     ->everyFiveMinutes()
     ->withoutOverlapping()
-    ->appendOutputTo(storage_path('logs/dw-sync.log'));
+    ->appendOutputTo(
+        storage_path('logs/dw-sync-and-reconcile.log')
+    );

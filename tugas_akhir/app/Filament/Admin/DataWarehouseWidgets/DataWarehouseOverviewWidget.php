@@ -10,7 +10,7 @@ use Filament\Widgets\StatsOverviewWidget\Stat;
 
 class DataWarehouseOverviewWidget extends StatsOverviewWidget
 {
-    protected ?string $heading = 'Ringkasan Kinerja Persediaan';
+    protected ?string $heading = 'Ringkasan Kinerja Inventori';
 
     protected static ?int $sort = 1;
 
@@ -26,7 +26,7 @@ class DataWarehouseOverviewWidget extends StatsOverviewWidget
 
     public static function canView(): bool
     {
-         return true;
+        return true;
     }
 
     protected function getStats(): array
@@ -47,16 +47,6 @@ class DataWarehouseOverviewWidget extends StatsOverviewWidget
             DB::table('dw_fact_outbound_transactions'),
             $warehouseId
         )->count();
-
-        $totalInboundValue = $this->applyFactFilters(
-            DB::table('dw_fact_inbound_transactions')->where('status', 'approved'),
-            $warehouseId
-        )->sum('grand_total');
-
-        $totalOutboundValue = $this->applyFactFilters(
-            DB::table('dw_fact_outbound_transactions')->where('status', 'approved'),
-            $warehouseId
-        )->sum('grand_total');
 
         $totalMovementIn = $this->applyFactFilters(
             DB::table('dw_fact_inventory_movements'),
@@ -102,16 +92,6 @@ class DataWarehouseOverviewWidget extends StatsOverviewWidget
                 ->description("Jumlah transaksi pengeluaran barang {$periodLabel}")
                 ->descriptionIcon('heroicon-m-arrow-up-tray')
                 ->color('warning'),
-
-            Stat::make('Nilai Barang Masuk Disetujui', 'Rp ' . number_format((float) $totalInboundValue, 0, ',', '.'))
-                ->description("Total nilai penerimaan barang yang telah disetujui {$periodLabel}")
-                ->descriptionIcon('heroicon-m-banknotes')
-                ->color('success'),
-
-            Stat::make('Nilai Barang Keluar Disetujui', 'Rp ' . number_format((float) $totalOutboundValue, 0, ',', '.'))
-                ->description("Total nilai pengeluaran barang yang telah disetujui {$periodLabel}")
-                ->descriptionIcon('heroicon-m-banknotes')
-                ->color('danger'),
 
             Stat::make('Kuantitas Barang Masuk', number_format((float) $totalMovementIn, 0, ',', '.'))
                 ->description("Akumulasi kuantitas barang masuk {$periodLabel}")
