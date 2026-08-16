@@ -3,6 +3,7 @@
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class DwEtlRun extends Model
 {
@@ -18,30 +19,43 @@ class DwEtlRun extends Model
 
     public const RECONCILIATION_FAILED = 'failed';
 
-    protected $fillable = [
-        'run_uuid',
-        'status',
-        'dimension_rows',
-        'fact_rows',
-        'table_row_counts',
-        'error_message',
-        'started_at',
-        'finished_at',
-        'duration_ms',
-        'reconciliation_status',
-        'reconciled_at',
-        'reconciliation_message',
-    ];
+   protected $fillable = [
+    'run_uuid',
+    'batch_code',
+    'trigger_type',
+    'triggered_by_user_id',
+    'status',
+    'dimension_rows',
+    'fact_rows',
+    'source_rows',
+    'target_rows',
+    'table_row_counts',
+    'error_message',
+    'started_at',
+    'finished_at',
+    'duration_ms',
+    'reconciliation_status',
+    'reconciled_at',
+    'reconciliation_message',
+];
 
     protected $casts = [
-        'dimension_rows' => 'integer',
-        'fact_rows' => 'integer',
-        'table_row_counts' => 'array',
-        'started_at' => 'datetime',
-        'finished_at' => 'datetime',
-        'duration_ms' => 'integer',
-        'reconciled_at' => 'datetime',
-    ];
+    'triggered_by_user_id' => 'integer',
+    'dimension_rows' => 'integer',
+    'fact_rows' => 'integer',
+    'source_rows' => 'integer',
+    'target_rows' => 'integer',
+    'table_row_counts' => 'array',
+    'started_at' => 'datetime',
+    'finished_at' => 'datetime',
+    'duration_ms' => 'integer',
+    'reconciled_at' => 'datetime',
+];
+
+public function triggeredByUser(): BelongsTo
+{
+    return $this->belongsTo(User::class, 'triggered_by_user_id');
+}
 
     public function details(): HasMany
 {
