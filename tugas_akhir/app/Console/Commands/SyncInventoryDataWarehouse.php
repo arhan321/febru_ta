@@ -34,9 +34,6 @@ class SyncInventoryDataWarehouse extends Command
         'dw_dim_suppliers',
         'dw_dim_customers',
         'dw_dim_users',
-        'dw_dim_asset_categories',
-        'dw_dim_asset_locations',
-        'dw_dim_assets',
     ];
 
     private const FACT_TABLES = [
@@ -44,7 +41,6 @@ class SyncInventoryDataWarehouse extends Command
         'dw_fact_inbound_transactions',
         'dw_fact_outbound_transactions',
         'dw_fact_stock_snapshots',
-        'dw_fact_asset_snapshots',
     ];
 
     protected $signature = 'dw:sync-inventory';
@@ -98,9 +94,6 @@ class SyncInventoryDataWarehouse extends Command
         $this->syncDimSuppliers();
         $this->syncDimCustomers();
         $this->syncDimUsers();
-        $this->syncDimAssetCategories();
-        $this->syncDimAssetLocations();
-        $this->syncDimAssets();
     }
 
     private function syncFacts(): void
@@ -111,7 +104,6 @@ class SyncInventoryDataWarehouse extends Command
         $this->syncFactOutboundTransactions();
         $this->syncFactInventoryMovements();
         $this->syncFactStockSnapshots();
-        $this->syncFactAssetSnapshots();
     }
 
     private function syncDimProducts(): void

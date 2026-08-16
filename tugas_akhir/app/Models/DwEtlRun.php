@@ -1,8 +1,8 @@
 <?php
 
 namespace App\Models;
-
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class DwEtlRun extends Model
 {
@@ -42,4 +42,10 @@ class DwEtlRun extends Model
         'duration_ms' => 'integer',
         'reconciled_at' => 'datetime',
     ];
+
+    public function details(): HasMany
+{
+    return $this->hasMany(DwEtlRunDetail::class, 'dw_etl_run_id')
+        ->orderBy('step_order');
+}
 }
