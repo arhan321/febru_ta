@@ -5,6 +5,7 @@ namespace App\Filament\Admin\Pages;
 use Throwable;
 use BackedEnum;
 use Carbon\Carbon;
+use App\Models\DwEtlRun;
 use Filament\Pages\Page;
 use Filament\Support\Enums\Width;
 use Illuminate\Support\Facades\DB;
@@ -12,6 +13,7 @@ use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Artisan;
 use Filament\Notifications\Notification;
+use Illuminate\Database\Eloquent\Collection;
 use App\Services\DataWarehouse\InventoryBiAnalyticsService;
 
 class DataWarehouseDashboard extends Page
@@ -54,6 +56,15 @@ class DataWarehouseDashboard extends Page
             ->orderBy('name')
             ->pluck('name', 'id')
             ->toArray();
+    }
+
+    public function getEtlHistory(): Collection
+    {
+        return DwEtlRun::query()
+            ->with('triggeredByUser')
+            ->latest('id')
+            ->limit(5)
+            ->get();
     }
 
     public function getProducts(): array

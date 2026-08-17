@@ -4,10 +4,7 @@ namespace App\Filament\Admin\DataWarehouseWidgets;
 
 use App\Models\DwEtlRun;
 use Filament\Tables\Table;
-use Filament\Actions\Action;
-use Filament\Support\Enums\Width;
 use Filament\Widgets\TableWidget;
-use Illuminate\Contracts\View\View;
 use Filament\Tables\Columns\TextColumn;
 use Illuminate\Database\Eloquent\Builder;
 
@@ -115,28 +112,6 @@ class DataWarehouseEtlHistoryWidget extends TableWidget
                     ->placeholder('-'),
             ])
             ->paginated([5, 10, 25])
-            ->defaultPaginationPageOption(5)
-            ->recordActions([
-            Action::make('detail')
-                ->label('Detail')
-                ->modalHeading(
-                    fn (DwEtlRun $record): string =>
-                        'Detail Proses ETL - ' . ($record->batch_code ?? 'Tanpa Kode Batch')
-                )
-                ->modalContent(
-                    fn (DwEtlRun $record): View => view(
-                        'filament.admin.data-warehouse-widgets.etl-history-detail',
-                        [
-                            'run' => $record->load([
-                                'details',
-                                'triggeredByUser',
-                            ]),
-                        ]
-                    )
-                )
-                ->modalSubmitAction(false)
-                ->modalCancelActionLabel('Tutup')
-                ->modalWidth(Width::SevenExtraLarge),
-        ]);
+            ->defaultPaginationPageOption(5);
     }
 }
