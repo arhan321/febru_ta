@@ -439,23 +439,51 @@ class DataWarehouseDashboard extends Page
     }
 
     public function syncNow(): void
-    {
-        try {
-            Artisan::call('dw:sync-inventory');
+{
+    try {
+        $parameters = [
+            '--trigger' => 'manual',
+        ];
 
-            Notification::make()
-                ->title('Sinkronisasi Data Warehouse Berhasil')
-                ->body('Data analitik inventori telah diperbarui dari database operasional.')
-                ->success()
-                ->send();
-        } catch (Throwable $e) {
+        $userId = auth()->id();
+
+        if ($userId !== null) {
+            $parameters['--user-id'] = $userId;
+        }
+
+        $exitCode = Artisan::call(
+            'dw:sync-inventory',
+            $parameters
+        );
+
+        if ($exitCode !== 0) {
             Notification::make()
                 ->title('Sinkronisasi Data Warehouse Gagal')
-                ->body($e->getMessage())
+                ->body(
+                    trim(Artisan::output())
+                    ?: 'Proses ETL tidak berhasil diselesaikan.'
+                )
                 ->danger()
                 ->send();
+
+            return;
         }
+
+        Notification::make()
+            ->title('Sinkronisasi Data Warehouse Berhasil')
+            ->body(
+                'Data analitik inventori telah diperbarui dari database operasional.'
+            )
+            ->success()
+            ->send();
+    } catch (Throwable $e) {
+        Notification::make()
+            ->title('Sinkronisasi Data Warehouse Gagal')
+            ->body($e->getMessage())
+            ->danger()
+            ->send();
     }
+}
 
     private function productNameColumn(): ?string
     {

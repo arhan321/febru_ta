@@ -864,6 +864,34 @@
             </div>
         </section>
 
+        <section class="dw-section-block">
+    <div class="dw-section-heading">
+        <div class="dw-section-heading-main">
+            <span class="dw-section-kicker">
+                ETL HISTORY
+            </span>
+
+            <h3 class="dw-section-title">
+                Riwayat Proses ETL
+            </h3>
+
+            <p class="dw-section-caption">
+                Menampilkan riwayat sinkronisasi Data Warehouse inventori,
+                termasuk kode batch, pemicu proses, pengguna, status,
+                jumlah baris sumber dan target, durasi, serta waktu proses.
+            </p>
+        </div>
+    </div>
+
+    <div class="dw-widget-wrap">
+        @livewire(
+            \App\Filament\Admin\DataWarehouseWidgets\DataWarehouseEtlHistoryWidget::class,
+            [],
+            key('dw-etl-history')
+        )
+    </div>
+</section>
+
         <section class="dw-filter-card">
             <div class="dw-filter-header">
                 <div>

@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use Safe\json;
 use Throwable;
 use Carbon\Carbon;
 use App\Models\User;
@@ -20,9 +21,11 @@ use App\Models\InboundTransaction;
 use Illuminate\Support\Facades\DB;
 use App\Models\OutboundTransaction;
 use Illuminate\Support\Facades\Schema;
+use App\Services\DataWarehouse\InventoryEtlMonitoringService;
 
 class SyncInventoryDataWarehouse extends Command
 {
+    private ?InventoryEtlMonitoringService $etlMonitoring = null;
     public const IMPLEMENTATION_VERSION = 'ETL-FIX-2026-07-28-V3';
 
     private const APPROVED_TRANSACTION_STATUS = 'approved';
@@ -43,7 +46,9 @@ class SyncInventoryDataWarehouse extends Command
         'dw_fact_stock_snapshots',
     ];
 
-    protected $signature = 'dw:sync-inventory';
+    protected $signature = 'dw:sync-inventory
+    {--trigger=manual : Pemicu ETL: manual atau scheduler}
+    {--user-id= : ID pengguna yang menjalankan ETL manual}';
 
     protected $description = 'Sync operational inventory data into data warehouse tables.';
 
@@ -51,8 +56,37 @@ class SyncInventoryDataWarehouse extends Command
     {
         $this->info('Starting inventory data warehouse sync...');
 
-        $startedAt = now();
-        $etlRunId = $this->startEtlRun($startedAt);
+    $startedAt = now();
+
+    $triggerType = strtolower(
+        trim((string) $this->option('trigger'))
+    );
+
+    if (! in_array($triggerType, ['manual', 'scheduler'], true)) {
+        $this->error(
+            'Trigger ETL tidak valid. Gunakan manual atau scheduler.'
+        );
+
+        return self::FAILURE;
+    }
+
+    $triggeredByUserId = $this->option('user-id');
+
+    $triggeredByUserId = filled($triggeredByUserId)
+        ? (int) $triggeredByUserId
+        : null;
+
+    $etlRunId = $this->startEtlRun(
+        $startedAt,
+        $triggerType,
+        $triggeredByUserId
+    );
+
+    $this->etlMonitoring = app(
+    InventoryEtlMonitoringService::class
+    );
+
+    $this->etlMonitoring->beginRun($etlRunId);
 
         try {
             DB::transaction(function (): void {
@@ -66,11 +100,14 @@ class SyncInventoryDataWarehouse extends Command
 
             return self::SUCCESS;
         } catch (Throwable $e) {
-            $this->failEtlRun($etlRunId, $startedAt, $e);
+            $this->etlMonitoring?->failRun($e);
+            $this->failEtlRun(
+                $etlRunId,
+                $startedAt,
+                $e
+            );
 
             $this->error('Sync failed: ' . $e->getMessage());
-
-            report($e);
 
             /*
              * During automated tests, expose the original exception and stack
@@ -86,25 +123,245 @@ class SyncInventoryDataWarehouse extends Command
     }
 
     private function syncDimensions(): void
-    {
-        $this->info('Syncing dimensions...');
+{
+    $this->info('Syncing dimensions...');
 
-        $this->syncDimProducts();
-        $this->syncDimWarehouses();
-        $this->syncDimSuppliers();
-        $this->syncDimCustomers();
-        $this->syncDimUsers();
-    }
+    $this->etlMonitoring?->startStep(
+        'dim_products',
+        Product::query()->count()
+    );
+
+    $this->syncDimProducts();
+
+    $this->etlMonitoring?->completeStep(
+        'dim_products',
+        DB::table('dw_dim_products')->count()
+    );
+
+    $this->etlMonitoring?->startStep(
+        'dim_warehouses',
+        Warehouse::query()->count()
+    );
+
+    $this->syncDimWarehouses();
+
+    $this->etlMonitoring?->completeStep(
+        'dim_warehouses',
+        DB::table('dw_dim_warehouses')->count()
+    );
+
+    $this->etlMonitoring?->startStep(
+        'dim_suppliers',
+        Supplier::query()->count()
+    );
+
+    $this->syncDimSuppliers();
+
+    $this->etlMonitoring?->completeStep(
+        'dim_suppliers',
+        DB::table('dw_dim_suppliers')->count()
+    );
+
+    $this->etlMonitoring?->startStep(
+    'dim_customers',
+    Customer::query()->count()
+    );
+
+    $this->syncDimCustomers();
+
+    $this->etlMonitoring?->completeStep(
+        'dim_customers',
+        DB::table('dw_dim_customers')->count()
+    );
+
+    $this->etlMonitoring?->startStep(
+    'dim_users',
+    User::query()->count()
+    );
+
+    $this->syncDimUsers();
+
+    $this->etlMonitoring?->completeStep(
+        'dim_users',
+        DB::table('dw_dim_users')->count()
+    );
+}
 
     private function syncFacts(): void
-    {
-        $this->info('Syncing facts...');
+{
+    $this->info('Syncing facts...');
 
-        $this->syncFactInboundTransactions();
-        $this->syncFactOutboundTransactions();
-        $this->syncFactInventoryMovements();
-        $this->syncFactStockSnapshots();
+    
+    $this->etlMonitoring?->startStep(
+        'fact_inbound',
+        InboundTransaction::query()
+            ->where('status', self::APPROVED_TRANSACTION_STATUS)
+            ->count()
+    );
+
+    $this->syncFactInboundTransactions();
+
+    $this->etlMonitoring?->completeStep(
+        'fact_inbound',
+        DB::table('dw_fact_inbound_transactions')->count()
+    );
+
+    
+    $this->etlMonitoring?->startStep(
+        'fact_outbound',
+        OutboundTransaction::query()
+            ->where('status', self::APPROVED_TRANSACTION_STATUS)
+            ->count()
+    );
+
+    $this->syncFactOutboundTransactions();
+
+    $this->etlMonitoring?->completeStep(
+        'fact_outbound',
+        DB::table('dw_fact_outbound_transactions')->count()
+    );
+
+  
+    $this->etlMonitoring?->startStep(
+        'fact_inventory_movements',
+        $this->countInventoryMovementSourceRows()
+    );
+
+    $this->syncFactInventoryMovements();
+
+    $this->etlMonitoring?->completeStep(
+        'fact_inventory_movements',
+        DB::table('dw_fact_inventory_movements')->count()
+    );
+
+    
+    $snapshotDate = now();
+
+    $this->etlMonitoring?->startStep(
+        'fact_stock_snapshots',
+        StockBalance::query()->count()
+    );
+
+    $this->syncFactStockSnapshots($snapshotDate);
+
+    $snapshotDateKey = (int) $snapshotDate
+        ->copy()
+        ->startOfDay()
+        ->format('Ymd');
+
+    $this->etlMonitoring?->completeStep(
+        'fact_stock_snapshots',
+        DB::table('dw_fact_stock_snapshots')
+            ->where('date_key', $snapshotDateKey)
+            ->count()
+    );
+}
+
+private function countInventoryMovementSourceRows(): int
+{
+    return $this->countInboundInventoryMovementSourceRows()
+        + $this->countOutboundInventoryMovementSourceRows()
+        + $this->countOtherStockMovementSourceRows();
+}
+
+private function countInboundInventoryMovementSourceRows(): int
+{
+    if (
+        ! Schema::hasTable('inbound_transactions')
+        || ! Schema::hasTable('inbound_transaction_items')
+    ) {
+        return 0;
     }
+
+    $warehouseExpression = $this->warehouseExpression(
+        'inbound_transaction_items',
+        'inbound_transactions',
+        'item',
+        'trx'
+    );
+
+    if (! $warehouseExpression) {
+        return 0;
+    }
+
+    $query = DB::table('inbound_transaction_items as item')
+        ->join(
+            'inbound_transactions as trx',
+            'trx.id',
+            '=',
+            'item.inbound_transaction_id'
+        )
+        ->whereNotNull('item.product_id')
+        ->where('item.qty', '>', 0)
+        ->whereRaw($warehouseExpression . ' IS NOT NULL');
+
+    $this->applyApprovedTransactionFilter(
+        $query,
+        'inbound_transactions',
+        'trx'
+    );
+
+    return (int) $query->count();
+}
+
+private function countOutboundInventoryMovementSourceRows(): int
+{
+    if (
+        ! Schema::hasTable('outbound_transactions')
+        || ! Schema::hasTable('outbound_transaction_items')
+    ) {
+        return 0;
+    }
+
+    $warehouseExpression = $this->warehouseExpression(
+        'outbound_transaction_items',
+        'outbound_transactions',
+        'item',
+        'trx'
+    );
+
+    if (! $warehouseExpression) {
+        return 0;
+    }
+
+    $query = DB::table('outbound_transaction_items as item')
+        ->join(
+            'outbound_transactions as trx',
+            'trx.id',
+            '=',
+            'item.outbound_transaction_id'
+        )
+        ->whereNotNull('item.product_id')
+        ->where('item.qty', '>', 0)
+        ->whereRaw($warehouseExpression . ' IS NOT NULL');
+
+    $this->applyApprovedTransactionFilter(
+        $query,
+        'outbound_transactions',
+        'trx'
+    );
+
+    return (int) $query->count();
+}
+
+private function countOtherStockMovementSourceRows(): int
+{
+    if (! Schema::hasTable('stock_movements')) {
+        return 0;
+    }
+
+    return (int) StockMovement::query()
+        ->where(function ($query): void {
+            $query->whereNull('reference_type')
+                ->orWhereNotIn('reference_type', [
+                    'inbound_transaction',
+                    'outbound_transaction',
+                    InboundTransaction::class,
+                    OutboundTransaction::class,
+                ]);
+        })
+        ->count();
+}
 
     private function syncDimProducts(): void
     {
@@ -682,9 +939,9 @@ class SyncInventoryDataWarehouse extends Command
             });
     }
 
-    private function syncFactStockSnapshots(): void
+    private function syncFactStockSnapshots(?Carbon $snapshotDate = null): void
     {
-        $snapshotDate = now();
+        $snapshotDate = $snapshotDate ?? now();
         $dateKey = $this->ensureDateDimension($snapshotDate);
 
         StockBalance::query()
@@ -962,33 +1219,53 @@ class SyncInventoryDataWarehouse extends Command
             ->delete();
     }
 
-    private function startEtlRun(Carbon $startedAt): ?int
-    {
-        if (! Schema::hasTable('dw_etl_runs')) {
-            return null;
-        }
-
-        try {
-            return DB::table('dw_etl_runs')->insertGetId([
-                'run_uuid' => (string) Str::uuid(),
-                'status' => 'running',
-                'dimension_rows' => 0,
-                'fact_rows' => 0,
-                'table_row_counts' => null,
-                'error_message' => null,
-                'started_at' => $startedAt,
-                'finished_at' => null,
-                'duration_ms' => null,
-                'created_at' => $startedAt,
-                'updated_at' => $startedAt,
-            ]);
-        } catch (Throwable $e) {
-            report($e);
-
-            return null;
-        }
+    private function startEtlRun(
+    Carbon $startedAt,
+    string $triggerType,
+    ?int $triggeredByUserId
+): ?int {
+    if (! Schema::hasTable('dw_etl_runs')) {
+        return null;
     }
 
+    try {
+        $runUuid = (string) Str::uuid();
+
+        $batchCode = sprintf(
+            'ETL-%s-%s',
+            $startedAt->format('Ymd-His'),
+            strtoupper(substr(str_replace('-', '', $runUuid), 0, 6))
+        );
+
+        return DB::table('dw_etl_runs')->insertGetId([
+            'run_uuid' => $runUuid,
+            'batch_code' => $batchCode,
+            'trigger_type' => $triggerType,
+            'triggered_by_user_id' => $triggeredByUserId,
+
+            'status' => 'running',
+
+            'dimension_rows' => 0,
+            'fact_rows' => 0,
+            'source_rows' => 0,
+            'target_rows' => 0,
+
+            'table_row_counts' => null,
+            'error_message' => null,
+
+            'started_at' => $startedAt,
+            'finished_at' => null,
+            'duration_ms' => null,
+
+            'created_at' => $startedAt,
+            'updated_at' => $startedAt,
+        ]);
+    } catch (Throwable $e) {
+        report($e);
+
+        return null;
+    }
+}
     private function completeEtlRun(?int $etlRunId, Carbon $startedAt): void
     {
         if (! $etlRunId || ! Schema::hasTable('dw_etl_runs')) {
@@ -1005,6 +1282,8 @@ class SyncInventoryDataWarehouse extends Command
                     'status' => 'success',
                     'dimension_rows' => $this->sumTableRows($rowCounts, self::DIMENSION_TABLES),
                     'fact_rows' => $this->sumTableRows($rowCounts, self::FACT_TABLES),
+                    'source_rows' => $this->etlMonitoring?->sourceRowsTotal() ?? 0,
+                    'target_rows' => $this->etlMonitoring?->targetRowsTotal() ?? 0,
                     'table_row_counts' => json_encode($rowCounts, JSON_THROW_ON_ERROR),
                     'error_message' => null,
                     'finished_at' => $finishedAt,
@@ -1029,6 +1308,8 @@ class SyncInventoryDataWarehouse extends Command
                 ->where('id', $etlRunId)
                 ->update([
                     'status' => 'failed',
+                    'source_rows' => $this->etlMonitoring?->sourceRowsTotal() ?? 0,
+                    'target_rows' => $this->etlMonitoring?->targetRowsTotal() ?? 0,
                     'error_message' => mb_substr($exception->getMessage(), 0, 65535),
                     'finished_at' => $finishedAt,
                     'duration_ms' => $this->durationInMilliseconds($startedAt, $finishedAt),

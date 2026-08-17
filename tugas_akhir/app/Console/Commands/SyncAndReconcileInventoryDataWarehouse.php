@@ -19,7 +19,9 @@ class SyncAndReconcileInventoryDataWarehouse extends Command
 
         $this->info('Tahap 1/2: Menjalankan sinkronisasi Data Warehouse...');
 
-        $syncExitCode = $this->call('dw:sync-inventory');
+        $syncExitCode = $this->call('dw:sync-inventory', [
+            '--trigger' => 'scheduler',
+        ]);
         $etlRun = $this->latestEtlRunAfter($previousRunId);
 
         if ($syncExitCode !== self::SUCCESS) {
